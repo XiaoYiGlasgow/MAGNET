@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - train_test_split
+
+_target_: nuplan.planning.training.data_loader.splitter.BasicSplitter
+
+# Override any train_test_split defaults if needed
+train_fraction: 0.8
+val_fraction: 0.1
+test_fraction: 0.1
+random_seed: 42

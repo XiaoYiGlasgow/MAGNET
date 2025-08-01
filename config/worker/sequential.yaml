@@ -1,0 +1,9 @@
+# @package _global_
+
+# Sequential worker configuration (no parallelization)
+_target_: nuplan.planning.utils.multithreading.worker_sequential.Sequential
+
+# Worker parameters
+number_of_processes: 1
+use_process_pool: false
+verbose: true

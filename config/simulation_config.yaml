@@ -1,0 +1,41 @@
+# @package _global_
+
+defaults:
+  - default_simulation
+  - /planner: gnn_transformer_planner
+  - _self_
+
+# ==================== Simulation Configuration ====================
+# Simulation log path (required by nuplan)
+simulation_log_main_path: null
+
+# Job configuration
+job_name: 'gnn_transformer_simulation'
+experiment_name: 'gnn_transformer_test'
+
+# Output configuration
+output_dir: '/mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans/nuplan_simulation_output'
+
+# Data paths
+scenario_builder:
+  data_root: '/mnt/local/Xiao_Yi/nuplan-devkit/nuplan/dataset/nuplan-v1.1/splits/train_pittsburgh'
+  map_root: '/mnt/local/Xiao_Yi/nuplan-devkit/nuplan/dataset/maps'
+
+# Scenario filtering for testing
+scenario_filter:
+  scenario_types: ['starting_left_turn', 'following_lane_with_lead']
+  num_scenarios_per_type: 2
+  limit_total_scenarios: 5
+  shuffle: true
+
+# Worker configuration
+worker:
+  threads_per_node: 1
+  use_process_pool: false
+
+# Verbose output
+verbose: true
+
+# GPU configuration
+number_of_gpus_allocated_per_simulation: 0.0
+number_of_cpus_allocated_per_simulation: 1

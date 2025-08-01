@@ -1,0 +1,41 @@
+# @package _global_
+defaults:
+  - simulation: default_simulation
+  - scenario_builder: nuplan_db
+  - scenario_filter: all_scenarios
+  - planner: simple_planner
+  - simulation_time_controller: step_simulation_time_controller
+  - _self_
+
+# Override scenario filter
+scenario_filter:
+  scenario_types:
+    - following_lane_with_lead
+    - changing_lane
+    - starting_left_turn
+    - starting_right_turn
+    - stopping_with_lead
+  limit_total_scenarios: 5
+  num_scenarios_per_type: 1
+  shuffle_scenarios: false
+
+# Simulation settings
+simulation:
+  time_horizon: 8.0
+  num_poses: 80
+
+simulation_time_controller:
+  time_step: 0.1
+
+# Data paths - 使用你的实际路径
+data_root: /mnt/local/Xiao_Yi/nuplan-devkit/nuplan/dataset/nuplan-v1.1/splits/train_pittsburgh
+map_root: /mnt/local/Xiao_Yi/nuplan-devkit/nuplan/dataset/maps
+map_version: nuplan-maps-v1.0
+
+# Output
+output_dir: ./simulation_results
+experiment_name: gnn_transformer_test
+
+# Worker
+worker: sequential
+verbose: true

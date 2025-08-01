@@ -1,0 +1,5 @@
+# Default train/test split configuration
+train_fraction: 0.8
+val_fraction: 0.1
+test_fraction: 0.1
+random_seed: 42

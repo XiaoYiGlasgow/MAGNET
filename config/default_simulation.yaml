@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - /scenario_builder: nuplan_mini
+  - /scenario_filter: all_scenarios
+  - /worker: sequential
+  - /splitter: nuplan
+
+# Required simulation parameters
+simulation_log_main_path: null
+
+# Basic simulation setup
+experiment_name: 'default_experiment'
+job_name: 'simulation_job'
+
+# Performance settings
+number_of_gpus_allocated_per_simulation: 0.0
+number_of_cpus_allocated_per_simulation: 1
+
+# Verbose logging
+verbose: true

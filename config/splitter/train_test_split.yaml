@@ -1,0 +1,16 @@
+# @package _global_
+
+# Basic train/test split configuration
+_target_: nuplan.planning.training.data_loader.splitter.BasicSplitter
+
+# Split ratios
+train_fraction: 0.8
+val_fraction: 0.1
+test_fraction: 0.1
+
+# Random seed for reproducibility
+random_seed: 42
+
+# Additional parameters
+shuffle: true
+stratify: false
