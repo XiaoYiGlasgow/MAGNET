@@ -1,42 +1,42 @@
 # GNN_Trans - Graph Neural Network with Transformer for Trajectory Prediction
 
-这个项目实现了基于图神经网络(GNN)和Transformer的轨迹预测模型，适用于自动驾驶场景。
+This project implements a trajectory prediction model based on Graph Neural Networks (GNN) and Transformer architecture, designed for autonomous driving scenarios.
 
-## 项目结构
+## Project Structure
 
-- `train.py` - 模型训练脚本
-- `evaluate.py` - 模型评估脚本
-- `inference.py` - 模型推理脚本
-- `config/` - 配置文件目录
-- `models/` - 模型定义
-- `planner/` - 规划器相关代码
-- `utils/` - 工具函数
-- `simple_demo.py` - 简单演示脚本
+- `train.py` - Model training script
+- `evaluate.py` - Model evaluation script
+- `inference.py` - Model inference script
+- `config/` - Configuration files directory
+- `models/` - Model definitions
+- `planner/` - Planner-related code
+- `utils/` - Utility functions
+- `simple_demo.py` - Simple demonstration script
 
-## 快速开始
+## Quick Start
 
-1. 安装依赖
+1. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-2. 训练模型
+2. Train the model
 ```bash
 python train.py
 ```
 
-3. 评估模型
+3. Evaluate the model
 ```bash
 python evaluate.py
 ```
 
-## 配置
+## Configuration
 
-主要配置文件位于 `config/` 目录下，可以根据需要调整模型参数和训练设置。
+Main configuration files are located in the `config/` directory. You can adjust model parameters and training settings as needed.
 
-## 演示
+## Demo
 
-运行演示脚本查看模型效果：
+Run the demonstration script to see the model performance:
 ```bash
 python simple_demo.py
 ```
