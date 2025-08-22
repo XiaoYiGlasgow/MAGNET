@@ -1,0 +1,14 @@
+{
+  "timestamp": "2025-08-22 18:55:01",
+  "epoch": 41,
+  "total_epochs": 100,
+  "progress_percentage": 41.0,
+  "train_loss": 0.00711696003149781,
+  "val_loss": 0.009655695245601236,
+  "ade": 1.1531810646876692,
+  "fde": 2.5609796603769066,
+  "learning_rate": 0.0001,
+  "elapsed_time_minutes": 0.5154866774876913,
+  "estimated_remaining_minutes": 30.413888867696127,
+  "status": "training"
+}

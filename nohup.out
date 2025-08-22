@@ -1,0 +1,18 @@
+========================================
+批量训练开始时间: Fri 22 Aug 18:13:19 BST 2025
+工作目录: /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans
+日志目录: /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans/batch_training_logs
+将依次训练4种配置...
+========================================
+
+🚀 开始训练配置 1 (default)
+开始时间: Fri 22 Aug 18:13:19 BST 2025
+正在运行: python train.py (自动选择配置 1)
+✅ 配置 1 (default) 训练成功完成!
+结束时间: Fri 22 Aug 18:33:21 BST 2025
+详细日志: /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans/batch_training_logs/config_1_default_20250822_181319.log
+休息10秒后开始下一个配置...
+
+🚀 开始训练配置 2 (ego_only)
+开始时间: Fri 22 Aug 18:33:31 BST 2025
+正在运行: python train.py (自动选择配置 2)

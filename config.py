@@ -51,7 +51,7 @@ WEIGHT_PATH = '/mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans/GNN_Trans_params'
 
 SEED = 42
 EPOCHS = 100
-BATCH_SIZE = 4
+BATCH_SIZE = 8
 
 LEARNING_RATE = 1e-3
 IN_CHANNELS = 10

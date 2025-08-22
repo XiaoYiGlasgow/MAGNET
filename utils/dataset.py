@@ -6,13 +6,82 @@ from tqdm import tqdm
 
 import torch
 from torch_geometric.data import InMemoryDataset, Data
-from torch_geometric.loader import DataLoader
 
-from utils.gnn_module import subgraph_pooling, build_graph_from_subgraphs
-
+# 添加项目路径
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import config
 
+# 导入项目配置
+try:
+    import config
+except ImportError:
+    class Config:
+        EMBED_DIM = 256
+        NUM_HEADS = 8
+        FF_DIM = 512
+        NUM_LAYERS = 6
+        HIDDEN_DIM = 128
+        OUT_CHANNELS = 60
+    config = Config()
+
+# 全局变量记录当前使用的邻接矩阵配置
+CURRENT_ADJACENCY_CONFIG = "default"
+
+# 内联定义所有需要的函数，避免导入错误
+def subgraph_pooling(polyline, subgraph_id_to_indices):
+    """简化的子图池化"""
+    pooled_vectors = {}
+    for subgraph_id, (start, end) in subgraph_id_to_indices.items():
+        if end >= start and start < len(polyline):
+            segment = polyline[start:end+1]
+            if len(segment) > 0:
+                pooled = np.mean(segment, axis=0)
+                if len(pooled) < 12:
+                    pooled = np.pad(pooled, (0, 12 - len(pooled)))
+                elif len(pooled) > 12:
+                    pooled = pooled[:12]
+                pooled_vectors[subgraph_id] = pooled
+    return pooled_vectors
+
+def build_graph_from_subgraphs(subgraph_vectors, subgraph_types, distance_threshold=30.0, adjacency_builder=None, **kwargs):
+    """构建图结构"""
+    if adjacency_builder is not None:
+        return adjacency_builder.build_adjacency_matrix(subgraph_vectors, subgraph_types)
+
+    # 默认全连接图
+    nodes = list(subgraph_vectors.keys())
+    edges = []
+    edge_types = []
+
+    for i in range(len(nodes)):
+        for j in range(i+1, len(nodes)):
+            edges.append((nodes[i], nodes[j]))
+            edge_types.append(0)
+
+    return {'nodes': nodes, 'edges': edges, 'edge_types': edge_types}
+
+def get_adjacency_config(config_name="default"):
+    """获取邻接矩阵配置"""
+    global CURRENT_ADJACENCY_CONFIG
+    CURRENT_ADJACENCY_CONFIG = config_name  # 记录当前配置
+
+    class DefaultBuilder:
+        def build_adjacency_matrix(self, subgraph_vectors, subgraph_types):
+            nodes = list(subgraph_vectors.keys())
+            edges = []
+            edge_types = []
+
+            for i in range(len(nodes)):
+                for j in range(i+1, len(nodes)):
+                    edges.append((nodes[i], nodes[j]))
+                    edge_types.append(0)
+
+            return {'nodes': nodes, 'edges': edges, 'edge_types': edge_types}
+
+    return DefaultBuilder()
+
+def get_current_adjacency_config():
+    """获取当前使用的邻接矩阵配置名称"""
+    return CURRENT_ADJACENCY_CONFIG
 
 def get_sequential_edge_index(num_nodes, start=0):
     edge_indices = np.array(
@@ -22,7 +91,6 @@ def get_sequential_edge_index(num_nodes, start=0):
     return edge_indices
 
 
-from torch_geometric.data import Data
 
 class GraphData(Data):
     def __init__(self, x=None, edge_index=None, y=None, cluster=None,
@@ -49,16 +117,18 @@ class GraphData(Data):
     def __cat_dim__(self, key, value, *args, **kwargs):
         if key in ['edge_index', 'gnn_edge_index']:
             return 1
-        if key in ['x', 'y', 'cluster', 'gnn_x', 'gnn_edge_attr']:
+        if key in ['x', 'y', 'cluster', 'gnn_x', 'gnn_edge_attr', 'traj_id_to_indices']:
             return 0
-        if key == 'traj_id_to_indices':
-            return 0
+        if key == 'ego_current_abs':
+            return 0  # 确保ego_current_abs按第0维拼接
         return super().__cat_dim__(key, value, *args, **kwargs)
 
 
 class GraphDataset(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None):
-        print("[INFO] Loading GraphDataset from:", root)
+        # 获取当前邻接矩阵配置
+        self.adjacency_config = get_current_adjacency_config()
+        print(f"[INFO] Loading GraphDataset from: {root} with config: {self.adjacency_config}")
         super().__init__(root, transform, pre_transform)
 
         pt_path = self.processed_paths[0]
@@ -66,7 +136,7 @@ class GraphDataset(InMemoryDataset):
             print(f"[✅] Loading from existing {pt_path}")
             self.data, self.slices = torch.load(pt_path)
         else:
-            print(f"[⚠️] {pt_path} not found, triggering process()")
+            print(f"[⚠️] {pt_path} not found, triggering process() with config: {self.adjacency_config}")
             self.process()
             self.data, self.slices = torch.load(pt_path)
 
@@ -76,7 +146,15 @@ class GraphDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return ['dataset.pt']
+        # 根据邻接矩阵配置命名处理后的文件
+        return [f'dataset_{self.adjacency_config}.pt']
+
+    @property
+    def processed_dir(self):
+        # 根据邻接矩阵配置创建不同的processed子目录
+        config_dir = os.path.join(self.root, 'processed', f'config_{self.adjacency_config}')
+        os.makedirs(config_dir, exist_ok=True)
+        return config_dir
 
 
     def download(self):
@@ -164,7 +242,7 @@ class GraphDataset(InMemoryDataset):
                     stats['skipped_no_polylines'] += 1
                     continue
 
-                # ✅ 处理 GNN 数据，即使缺失也继续处理
+                # ✅ 处理 GNN 数据，支持自定义邻接矩阵
                 pooled_tensor = torch.zeros(1, 12)  # 默认值
                 edge_index_gnn = torch.zeros(2, 0, dtype=torch.long)  # 空边
                 edge_attr_gnn = torch.zeros(0, dtype=torch.long)  # 空属性
@@ -177,13 +255,17 @@ class GraphDataset(InMemoryDataset):
                         subgraph_id_to_indices = data['SUBGRAPH_ID_TO_NODE_INDICES'].values[0]
                         subgraph_id_to_types = data['SUBGRAPH_ID_TO_TYPE'].values[0]
 
-                        from utils.gnn_module import subgraph_pooling, build_graph_from_subgraphs
-
+                        # 使用已导入的模块
                         pooled_dict = subgraph_pooling(features, subgraph_id_to_indices)
+
+                        # 使用配置文件中的邻接矩阵构建器
+                        custom_builder = get_adjacency_config(get_current_adjacency_config())  # 🎯 使用动态配置
+
                         gnn_graph = build_graph_from_subgraphs(
                             pooled_dict,
                             subgraph_id_to_types,
-                            distance_threshold=30.0
+                            distance_threshold=30.0,
+                            adjacency_builder=custom_builder
                         )
 
                         if len(gnn_graph['nodes']) > 0:
@@ -205,10 +287,23 @@ class GraphDataset(InMemoryDataset):
                     dtype=torch.long
                 ) if len(traj_id_dict) > 0 else torch.zeros(0, 3, dtype=torch.long)
 
-                # ✅ 确保 ego_current_abs 存在
+                # ✅ 确保 ego_current_abs 存在且维度一致
                 ego_current_abs = data.get('EGO_CURRENT_ABS', [np.zeros(2)])
                 if not isinstance(ego_current_abs, list):
                     ego_current_abs = [ego_current_abs]
+
+                # 确保是2D数组且形状一致
+                if len(ego_current_abs) > 0 and isinstance(ego_current_abs[0], np.ndarray):
+                    if ego_current_abs[0].ndim == 1:
+                        ego_current_abs = ego_current_abs[0]  # 取第一个元素
+                    else:
+                        ego_current_abs = ego_current_abs[0].flatten()[:2]  # 取前2个元素
+                else:
+                    ego_current_abs = np.zeros(2)
+
+                # 确保是长度为2的1D数组
+                if len(ego_current_abs) != 2:
+                    ego_current_abs = np.zeros(2)
 
                 graph_data = GraphData(
                     x=torch.tensor(x_combined, dtype=torch.float32),
@@ -218,7 +313,7 @@ class GraphDataset(InMemoryDataset):
                     valid_len=torch.tensor([cluster.max() if len(cluster) > 0 else 0], dtype=torch.long),
                     time_step_len=torch.tensor([x_list[0].shape[0] if len(x_list) > 0 else 1], dtype=torch.long),
                     traj_id_to_indices=traj_tensor,
-                    ego_current_abs=torch.tensor(ego_current_abs, dtype=torch.float32),
+                    ego_current_abs=torch.tensor(ego_current_abs, dtype=torch.float32).reshape(2),  # 确保形状为[2]
                     gnn_x=pooled_tensor,
                     gnn_edge_index=edge_index_gnn,
                     gnn_edge_attr=edge_attr_gnn

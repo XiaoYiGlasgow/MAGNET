@@ -4,21 +4,16 @@ GNN_Trans Planner for nuBoard visualization
 
 import numpy as np
 import torch
-from typing import List, Type
+from typing import Type
 
 from nuplan.common.actor_state.state_representation import StateSE2
-from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner
-from nuplan.planning.simulation.planner.planner_report import PlannerInput, PlannerReport
+from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner, PlannerInput
 from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
 
 import sys
 import os
 sys.path.append('/mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans')
-sys.path.append('/mnt/local/Xiao_Yi/nuplan-devkit')
-
-import config
 from models.transformer_predictor import TransformerPredictor
-from utils.dataset import process_scenario_for_inference
 
 
 class GNNTransPlanner(AbstractPlanner):

@@ -20,7 +20,7 @@ sys.path.append('/mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans')
 
 import config
 from models.transformer_predictor import TransformerPredictor
-from utils.dataset import GraphDataset
+from utils.dataset import GraphDataset, get_current_adjacency_config
 
 def restore_trajectory_from_increments(origin, increments):
     """
@@ -47,16 +47,17 @@ def restore_trajectory_from_increments(origin, increments):
 
 def evaluate_model():
     """Evaluate model performance"""
-    print("Starting GNN_Trans model evaluation...")
+    print(" Starting GNN_Trans model evaluation...")
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Create evaluation results folder with timestamp
+    # Create evaluation results folder with timestamp and adjacency config
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_folder = Path(config.WEIGHT_PATH) / f"evaluation_results_{timestamp}"
+    adj_config = get_current_adjacency_config()
+    results_folder = Path(config.WEIGHT_PATH) / f"evaluation_results_{adj_config}_{timestamp}"
     results_folder.mkdir(exist_ok=True)
-    print(f"Results will be saved to: {results_folder}")
+    print(f" Results will be saved to: {results_folder}")
 
     # Load test data
     test_dataset = GraphDataset(config.TEST_PATH)
@@ -71,7 +72,7 @@ def evaluate_model():
     weight_files = list(weight_path.glob("*.pth"))
 
     if not weight_files:
-        print("No trained model weights found")
+        print("❌ No trained model weights found")
         return
 
     latest_weight = max(weight_files, key=os.path.getctime)
@@ -104,18 +105,18 @@ def evaluate_model():
 
             total_loss += torch.sum(batch_mse).item()
 
-            # ADE/FDE calculation: restore to absolute trajectories first
+            # ✅ 新的ADE/FDE计算：先还原为绝对轨迹
             pred_increments = output.view(batch_size, -1, 2)  # [batch, time_steps, 2]
             true_increments = y_true.view(batch_size, -1, 2)
 
-            # Assume starting position is origin (0, 0) - because data is relative increments
+            # 假设起始位置为原点 (0, 0) - 因为数据是相对增量
             origin = torch.zeros(batch_size, 2, device=device)
 
-            # Restore to absolute trajectories
+            # 还原为绝对轨迹
             pred_absolute = restore_trajectory_from_increments(origin, pred_increments)
             true_absolute = restore_trajectory_from_increments(origin, true_increments)
 
-            # Calculate ADE and FDE for absolute trajectories
+            # 计算绝对轨迹的ADE和FDE
             displacement_errors = torch.norm(pred_absolute - true_absolute, dim=2)  # [batch, time_steps]
             ade = torch.mean(displacement_errors, dim=1)  # [batch]
             fde = displacement_errors[:, -1]  # [batch]
@@ -135,7 +136,7 @@ def evaluate_model():
     std_ade = np.std(ade_list)
     std_fde = np.std(fde_list)
 
-    print(f"\nEvaluation Results:")
+    print(f"\n Evaluation Results:")
     print(f"   MSE Loss: {avg_mse:.6f}")
     print(f"   ADE: {avg_ade:.4f} ± {std_ade:.4f} meters")
     print(f"   FDE: {avg_fde:.4f} ± {std_fde:.4f} meters")
@@ -180,7 +181,7 @@ def evaluate_model():
     result_file = results_folder / 'evaluation_summary.json'
     with open(result_file, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"Evaluation results saved to: {result_file}")
+    print(f"✅ Evaluation results saved to: {result_file}")
 
     # Save raw data separately
     raw_data_file = results_folder / 'raw_error_data.npz'
@@ -188,7 +189,7 @@ def evaluate_model():
              ade=np.array(ade_list),
              fde=np.array(fde_list),
              mse=np.array(mse_list))
-    print(f"Raw data saved to: {raw_data_file}")
+    print(f"✅ Raw data saved to: {raw_data_file}")
 
     # Plot error distribution
     plot_error_distribution(ade_list, fde_list, mse_list, results_folder)
