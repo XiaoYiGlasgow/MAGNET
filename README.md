@@ -1,4 +1,4 @@
-# GNN_Trans: Graph Neural Network Transformer for Trajectory Prediction
+# MAGNET: Graph Neural Network Transformer for Trajectory Prediction
 
 A deep learning model combining Graph Neural Networks and Transformer architecture for autonomous vehicle trajectory prediction using the nuPlan dataset.
 
