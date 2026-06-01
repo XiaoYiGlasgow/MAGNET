@@ -1,6 +1,6 @@
 # MAGNET
 
-MAGNET is a trajectory prediction and planning project built on top of the nuPlan dataset and simulation stack. This repository contains the current public trajectory-prediction code path, including the main GNN + Transformer model, Transformer-only and LSTM baselines, preprocessing scripts, evaluation entrypoints, and nuPlan simulation integration.
+MAGNET is a trajectory prediction and planning project built on top of the nuPlan dataset and simulation stack. This repository includes the main GNN + Transformer model, Transformer-only and LSTM baselines, preprocessing scripts, evaluation entrypoints, and nuPlan simulation integration.
 
 ## Highlights
 
@@ -185,9 +185,3 @@ If the run succeeds, nuBoard can be opened in the browser, typically at `http://
 - `docs/tutorials/02_trajectory_prediction.md`: step-by-step tutorial
 - `docs/reports/summary.md`: result summary
 - `docs/reports/results_analysis_report.md`: detailed analysis report
-
-## Notes
-
-- This public repository tracks the trajectory-prediction line only. The separate danger-generation work is intentionally excluded.
-- Large datasets, model checkpoints, experiment outputs, and private work records are not included.
-- Some internal documents may still mention the historical local folder name `GNN_Trans`; in this public repo, use `MAGNET` instead.
