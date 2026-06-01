@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - planner: gnn_trans_planner
+  - scenario_builder: nuplan
+  - scenario_filter: all_scenarios
+
+simulation_log_main_path: ${oc.env:NUPLAN_SIMULATION_ROOT,/tmp}/simulation_results
+log_config_path: ${simulation_log_main_path}/log_config.yaml
+
+hydra:
+  run:
+    dir: ${simulation_log_main_path}/${experiment}

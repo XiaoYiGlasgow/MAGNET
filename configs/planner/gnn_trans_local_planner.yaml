@@ -1,0 +1,7 @@
+gnn_trans_local_planner:
+  _target_: GNN_Trans.planner.gnn_trans_planner.GNNTransPlanner
+  _convert_: 'all'
+  model_path: /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans/experiments/analysis/gnn_trans_ablation/results_type_high_magnitude_speed_default_adjacency/training_20250923_165322_ds450_bs8_lr5e-04/models/best_model_default.pth
+  horizon_seconds: 8.0
+  sampling_time: 0.1
+  device: cpu

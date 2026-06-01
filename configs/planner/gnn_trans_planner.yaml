@@ -1,0 +1,13 @@
+# @package _global_
+
+gnn_trans_planner:
+  _target_: GNN_Trans.planner.gnn_trans_planner.GNNTransPlanner
+  _convert_: 'all'
+  model_path: /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans/GNN_Trans_params/best_model.pth
+  horizon_seconds: 8.0
+  sampling_time: 0.1
+  device: cuda
+
+# Performance parameters
+max_velocity: 15.0
+fallback_velocity: 5.0

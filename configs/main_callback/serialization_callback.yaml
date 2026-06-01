@@ -1,0 +1,7 @@
+# @package main_callback
+serialization_callback:
+  _target_: nuplan.planning.simulation.callback.serialization_callback.SerializationCallback
+  _convert_: 'all'
+  folder_name: simulation
+  serialize_into_single_file: false
+  serialization_type: "json"

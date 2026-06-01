@@ -1,110 +1,49 @@
-# MAGNET: Graph Neural Network Transformer for Trajectory Prediction
+# MAGNET
 
-A deep learning model combining Graph Neural Networks and Transformer architecture for autonomous vehicle trajectory prediction using the nuPlan dataset.
+Trajectory prediction and planning code built on the nuPlan dataset.
 
-## Prerequisites
+This public repository tracks the current trajectory-prediction project line from the private development repo. It keeps the active training, evaluation, simulation, and documentation structure, and does not include the separate danger-generation work.
 
-### 1. Install nuplan-devkit
+## Main Entry Points
 
-Before training the GNN_Trans model, you need to install the nuplan-devkit project:
+- `train.py`: GNN + Transformer training
+- `train_transformer_only.py`: Transformer-only baseline training
+- `train_lstm.py`: LSTM baseline training
+- `run_gnn_manifest_eval.py`: GNN + Transformer evaluation
+- `run_transformer_only_manifest_eval.py`: Transformer-only evaluation
+- `run_idm_pkl_eval.py`: IDM baseline evaluation
+- `run_lstm_pkl_eval.py`: LSTM baseline evaluation
+- `run_nuboard_simulation.py`: nuPlan simulation entry
 
-```bash
-# Clone nuplan-devkit repository
-git clone https://github.com/motional/nuplan-devkit.git
-cd nuplan-devkit
+## Current Structure
 
-# Create conda environment
-conda create -n nuplan python=3.9
-conda activate nuplan
-
-# Install dependencies
-pip install -e .
-pip install torch torchvision torchaudio
-pip install torch-geometric
+```text
+MAGNET/
+├── configs/                  # Hydra and simulation configs
+├── docs/                     # Project docs, tutorials, and reports
+├── scripts/
+│   ├── analysis/             # Analysis and visualization scripts
+│   └── preprocessing/        # Dataset preprocessing utilities
+├── src/
+│   ├── ego_planning/         # Planner and nuBoard integration
+│   └── shared/utils/         # Shared data and model utilities
+├── config.py                 # Training configuration
+├── idm_predictor.py          # IDM baseline model
+├── lstm_predictor.py         # LSTM baseline model
+├── train.py
+├── train_lstm.py
+├── train_transformer_only.py
+└── run_*                     # Evaluation and simulation entrypoints
 ```
 
-### 2. Data Setup
+## Documentation
 
-Download the nuPlan dataset and configure the data paths:
+- `docs/README.md`: documentation index
+- `docs/TRAJECTORY_PREDICTION.md`: project-level trajectory prediction guide
+- `docs/tutorials/02_trajectory_prediction.md`: step-by-step training and evaluation tutorial
+- `docs/reports/summary.md`: summary of trajectory-prediction results
 
-```bash
-export NUPLAN_DATA_ROOT="/path/to/nuplan/data"
-export NUPLAN_MAPS_ROOT="/path/to/nuplan/maps"
-```
+## Notes
 
-## Installation
-
-1. Clone this repository inside the nuplan-devkit folder:
-```bash
-cd nuplan-devkit
-git clone https://github.com/XiaoYiGlasgow/GNN_Trans.git
-```
-
-2. Install additional dependencies:
-```bash
-cd GNN_Trans
-pip install pandas matplotlib seaborn scipy
-```
-
-## Usage
-
-### Training
-
-```bash
-cd GNN_Trans
-python train.py
-```
-
-### Evaluation
-
-```bash
-python evaluate.py
-```
-
-### Visualization
-
-Generate comprehensive evaluation reports:
-```bash
-python visualize_evaluation.py
-```
-
-### nuBoard Visualization
-
-Visualize predictions in nuBoard:
-```bash
-cd Nuboard
-python run_gnn_trans_simulation.py
-python launch_gnn_trans_nuboard.py
-```
-
-## Model Architecture
-
-The GNN_Trans model combines:
-- **Graph Neural Network**: Processes spatial relationships between vehicles
-- **Transformer**: Captures temporal dependencies in trajectories
-- **Multi-head Attention**: Focuses on relevant trajectory features
-
-## Performance
-
-Current model performance:
-- **ADE**: 0.57 meters (Average Displacement Error)
-- **FDE**: 1.26 meters (Final Displacement Error)
-- **MSE Loss**: 0.002
-
-## Project Structure
-
-```
-GNN_Trans/
-├── models/                 # Model architectures
-├── utils/                  # Data processing utilities
-├── Nuboard/               # nuBoard visualization tools
-├── GNN_Trans_params/      # Trained model weights
-├── processed_data/        # Processed training data
-├── train.py              # Training script
-├── evaluate.py           # Evaluation script
-└── visualize_evaluation.py # Visualization tools
-```
-
-## License
-
-This project is for research and educational purposes.
+- The examples in some internal docs may still show a local folder name like `GNN_Trans` from the private development environment. If you clone this public repo as `MAGNET`, replace that path accordingly when running commands.
+- Large data, checkpoints, training outputs, and private work records are intentionally excluded from this public repo.

@@ -1,0 +1,7 @@
+_target_: nuplan.planning.training.data_loader.splitter.BasicSplitter
+_convert_: 'all'
+
+train_fraction: 0.8
+val_fraction: 0.1
+test_fraction: 0.1
+random_seed: 42

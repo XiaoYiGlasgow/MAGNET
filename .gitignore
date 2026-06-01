@@ -42,6 +42,10 @@ result_transformer/
 *.jpg
 *.jpeg
 
+# Backup source files
+*backup*.py
+*.backup
+
 # IDE
 .vscode/
 .idea/

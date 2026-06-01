@@ -1,222 +1,511 @@
 import os
 import sys
 import time
+import json
+from typing import Tuple
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
-from torch_geometric.loader import DataLoader
 from torch.utils.data import Subset
+from torch_geometric.loader import DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-import json
-import numpy as np
-import logging
 
-# ✅ 添加项目根路径
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Add current directory to path for local imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, current_dir)
+repo_root = str(Path(current_dir).parent)
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+repo_models_dir = os.path.join(repo_root, "models")
+if repo_models_dir not in sys.path:
+    sys.path.insert(0, repo_models_dir)
+
+# 强制清除可能的缓存模块
+modules_to_clear = ['utils', 'utils.dataset', 'dataset', 'config']
+for module_name in modules_to_clear:
+    if module_name in sys.modules:
+        del sys.modules[module_name]
 
 import config
-from models.transformer_predictor import TransformerPredictor
-from utils.dataset import GraphDataset
-from adjacency_configs import get_adjacency_config
 
-# 直接从utils.dataset导入get_current_adjacency_config
 try:
-    from utils.dataset import get_current_adjacency_config
-except ImportError:
-    # 如果导入失败，定义一个备用函数
-    def get_current_adjacency_config():
-        return "default"
+    from transformer_predictor import TransformerPredictor
+except ImportError as e:
+    print(f"模型导入错误: {e}")
+    print(f"检查路径: {repo_root}/models")
+    sys.exit(1)
 
-from setproctitle import setproctitle
+try:
+    from src.shared.utils.dataset import GraphDataset, get_adjacency_config
+    print(f"[SUCCESS] 成功导入GraphDataset和get_adjacency_config")
+except ImportError as e:
+    print(f"数据集导入错误: {e}")
+    sys.exit(1)
 
-setproctitle("Yi Xiao")
+def restore_trajectory_from_increments(reference_origin: torch.Tensor, increments: torch.Tensor) -> torch.Tensor:
+    """Restore absolute trajectory from incremental movements."""
+    batch_size = reference_origin.shape[0]
+    num_timesteps = increments.shape[1]
 
-def setup_logging(log_file_path):
-    """设置详细的日志记录"""
-    # 创建logger
-    logger = logging.getLogger('training')
-    logger.setLevel(logging.INFO)
+    # Initialize trajectory with reference origin
+    trajectory = torch.zeros(batch_size, num_timesteps, 2, device=reference_origin.device)
 
-    # 移除已有的handlers
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
+    # First timestep is the reference origin
+    current_pos = reference_origin
 
-    # 创建文件handler
-    file_handler = logging.FileHandler(log_file_path, mode='w')
-    file_handler.setLevel(logging.INFO)
+    for t in range(num_timesteps):
+        current_pos = current_pos + increments[:, t, :]
+        trajectory[:, t, :] = current_pos
 
-    # 创建控制台handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    return trajectory
 
-    # 创建formatter
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
+def convert_to_vehicle_frame(global_points: torch.Tensor, ego_position: torch.Tensor, ego_heading: float) -> torch.Tensor:
+    """
+    将全局坐标转换为车辆局部坐标系
+    车辆局部坐标系：x轴指向前方，y轴指向左方
+    """
+    # 计算相对位置
+    relative_points = global_points - ego_position
+    
+    # 旋转到车辆坐标系
+    cos_h = torch.cos(-ego_heading)
+    sin_h = torch.sin(-ego_heading)
+    
+    local_x = relative_points[..., 0] * cos_h - relative_points[..., 1] * sin_h
+    local_y = relative_points[..., 0] * sin_h + relative_points[..., 1] * cos_h
+    
+    return torch.stack([local_x, local_y], dim=-1)
 
-    # 添加handlers
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+def convert_to_global_frame(local_points: torch.Tensor, ego_position: torch.Tensor, ego_heading: float) -> torch.Tensor:
+    """
+    将车辆局部坐标系转换为全局坐标
+    """
+    cos_h = torch.cos(ego_heading)
+    sin_h = torch.sin(ego_heading)
+    
+    global_x = local_points[..., 0] * cos_h - local_points[..., 1] * sin_h
+    global_y = local_points[..., 0] * sin_h + local_points[..., 1] * cos_h
+    
+    global_points = torch.stack([global_x, global_y], dim=-1) + ego_position
+    
+    return global_points
 
-    return logger
+def create_training_folders(adjacency_config: str, dataset_size: int, batch_size: int, learning_rate: float) -> dict:
+    """Create training folders for organizing results."""
+    import os
+    scenario_type = "unknown"
+    if hasattr(config, 'TRAIN_PATH'):
+        path_parts = config.TRAIN_PATH.split(os.sep)
+        for part in path_parts:
+            # 精确匹配场景类型文件夹，避免误匹配包含"processed_"的其他文件夹
+            if part.startswith('processed_') and part != 'processed_data_by_type':
+                # 从 "processed_high_magnitude_speed" 提取 "high_magnitude_speed"
+                scenario_name = part.replace('processed_', '', 1)  # 只替换第一个匹配
+                scenario_type = f"type_{scenario_name}"
+                break
+            elif part.startswith('type_'):
+                scenario_type = part
+                break
+    
+    print(f"Extracted scenario type: {scenario_type} from TRAIN_PATH: {config.TRAIN_PATH}")
 
+    # Create main results folder
+    main_folder = f"results_{scenario_type}_{adjacency_config}_adjacency"
+    main_path = os.path.join(config.ALL_RESULTS_DIR, main_folder)
 
-def save_progress_info(folders, epoch, total_epochs, train_loss, val_loss, ade, fde,
-                      learning_rate, elapsed_time, estimated_remaining):
-    """保存详细的训练进度信息"""
-    progress_info = {
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'epoch': epoch + 1,
-        'total_epochs': total_epochs,
-        'progress_percentage': ((epoch + 1) / total_epochs) * 100,
-        'train_loss': train_loss,
-        'val_loss': val_loss,
-        'ade': ade,
-        'fde': fde,
-        'learning_rate': learning_rate,
-        'elapsed_time_minutes': elapsed_time / 60,
-        'estimated_remaining_minutes': estimated_remaining / 60,
-        'status': 'training'
-    }
-
-    # 保存到progress.json文件
-    progress_file = os.path.join(folders['base'], 'progress.json')
-    with open(progress_file, 'w') as f:
-        json.dump(progress_info, f, indent=2)
-
-    # 保存历史记录
-    history_file = os.path.join(folders['logs'], 'progress_history.jsonl')
-    with open(history_file, 'a') as f:
-        f.write(json.dumps(progress_info) + '\n')
-
-def select_adjacency_config_for_training():
-    """让用户选择完整训练使用的邻接矩阵配置"""
-    configs = {
-        "1": ("default", "默认全连接模式 - 信息最丰富"),
-        "2": ("ego_only", "ego为中心的星型连接 - 计算高效"),
-        "3": ("no_ego_road", "禁止ego连接道路元素 - 测试道路信息重要性"),
-        "4": ("nearby_only", "只连接15米内的元素 - 平衡性能和效率")
-    }
-
-    print("\n🔧 选择完整训练使用的邻接矩阵配置:")
-    print("=" * 50)
-    for key, (config_name, description) in configs.items():
-        print(f"  {key}. {config_name} - {description}")
-
-    while True:
-        choice = input("\n请选择配置 (1-4): ").strip()
-        if choice in configs:
-            config_name, description = configs[choice]
-            print(f"✅ 选择了配置: {config_name} - {description}")
-            return config_name
-        else:
-            print("❌ 无效选择，请重新输入!")
-
-def set_adjacency_config_for_training(config_name):
-    """设置完整训练的邻接矩阵配置"""
-    # 直接使用已导入的函数
-    get_adjacency_config(config_name)
-    print(f"🔧 已设置完整训练邻接矩阵配置: {config_name}")
-
-def create_training_folders(config_name, dataset_size, batch_size, learning_rate):
-    """创建训练结果文件夹，包含训练基本信息"""
+    # Create training session subfolder with timestamp
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    training_dir = f"training_{timestamp}_{config_name}_ds{dataset_size}_bs{batch_size}_lr{learning_rate:.0e}"
+    session_folder = f"training_{timestamp}_ds{dataset_size}_bs{batch_size}_lr{learning_rate:.0e}"
+    session_path = os.path.join(main_path, session_folder)
 
     folders = {
-        'base': training_dir,
-        'models': os.path.join(training_dir, 'models'),
-        'results': os.path.join(training_dir, 'results'),
-        'logs': os.path.join(training_dir, 'logs'),
-        'plots': os.path.join(training_dir, 'plots')
+        'base': session_path,
+        'models': os.path.join(session_path, 'models'),
+        'results': os.path.join(session_path, 'results'),
+        'logs': os.path.join(session_path, 'logs')
     }
 
     for folder in folders.values():
         os.makedirs(folder, exist_ok=True)
 
-    print(f"📁 创建训练文件夹: {training_dir}")
     return folders
 
-def restore_trajectory_from_increments(origin, increments):
-    """
-    将增量轨迹还原为绝对轨迹
 
-    Args:
-        origin: 起始绝对位置 [batch_size, 2]
-        increments: 增量序列 [batch_size, time_steps, 2]
+def setup_logging(log_file_path: str):
+    """Setup logging configuration."""
+    import logging
 
-    Returns:
-        absolute_trajectory: 绝对轨迹 [batch_size, time_steps, 2]
-    """
-    batch_size, time_steps, _ = increments.shape
-    absolute_trajectory = torch.zeros_like(increments)
-
-    # 第一个点：起始位置 + 第一个增量
-    absolute_trajectory[:, 0, :] = origin + increments[:, 0, :]
-
-    # 后续点：累加增量
-    for i in range(1, time_steps):
-        absolute_trajectory[:, i, :] = absolute_trajectory[:, i - 1, :] + increments[:, i, :]
-
-    return absolute_trajectory
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file_path),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
 
 
-def validate(model, val_loader, criterion, device):
+def save_progress_info(folders: dict, epoch: int, total_epochs: int, train_loss: float,
+                      val_loss: float, ade: float, fde: float, lr: float,
+                      epoch_time: float, estimated_remaining: float):
+    """Save training progress information."""
+    progress_info = {
+        'epoch': epoch + 1,
+        'total_epochs': total_epochs,
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'ade': ade,
+        'fde': fde,
+        'learning_rate': lr,
+        'epoch_time': epoch_time,
+        'estimated_remaining_time': estimated_remaining,
+        'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    progress_file = os.path.join(folders['base'], 'training_progress.json')
+    with open(progress_file, 'w') as f:
+        json.dump(progress_info, f, indent=2)
+
+
+# Global adjacency config state
+_current_adjacency_config = "default"
+
+
+def select_adjacency_config_for_training() -> str:
+    """Interactive adjacency configuration selection for training."""
+    configs = {
+        "1": ("default", "Default: Full connectivity between all entities"),
+        "2": ("ego_only", "Ego Only: Only ego vehicle connects to other entities"),
+        "3": ("no_ego_road", "No Ego-Road: Ego doesn't connect to road elements"),
+        "4": ("nearby_only", "Nearby Only: Only connect nearby entities"),
+        "5": ("selective", "Selective: Custom connection patterns")
+    }
+
+    print("\n" + "="*60)
+    print("SELECT ADJACENCY MATRIX CONFIGURATION")
+    print("="*60)
+
+    for key, (config_name, description) in configs.items():
+        print(f"{key}. {config_name.upper()}: {description}")
+
+    print("="*60)
+
+    while True:
+        try:
+            choice = input("Select configuration (1-5) [default=1]: ")
+
+
+            if not choice:
+                choice = "1"
+
+            if choice in configs:
+                selected_config = configs[choice][0]
+                print(f"Selected: {selected_config.upper()}")
+                print("="*60)
+                return selected_config
+            else:
+                print("Invalid choice. Please enter 1-5.")
+        except KeyboardInterrupt:
+            print("\nUsing default configuration.")
+            return "default"
+
+
+def set_adjacency_config_for_training(config_name: str):
+    """Set the current adjacency configuration."""
+    global _current_adjacency_config
+    _current_adjacency_config = config_name
+
+
+def get_current_adjacency_config() -> str:
+    """Get the current adjacency configuration."""
+    return _current_adjacency_config
+
+
+def validate(model: nn.Module, val_loader: DataLoader, criterion: nn.Module, device: torch.device) -> Tuple[float, float, float]:
+    """Validate the model and return validation loss, ADE, and FDE metrics."""
     model.eval()
     val_loss = 0.0
+    num_samples = 0
     ade_list = []
     fde_list = []
-    num_samples = 0
+    increment_errors = []
 
     with torch.no_grad():
-        for data in val_loader:
+        for i, data in enumerate(val_loader):
+            # 添加详细的数据检查
+            if i == 0:
+                print(f"  [DATA CHECK] Before processing:")
+                print(f"    Data type: {type(data)}")
+                print(f"    Available keys: {sorted(list(data.keys()))}")
+                print(f"    Has ego_history (hasattr): {hasattr(data, 'ego_history')}")
+                print(f"    'ego_history' in keys: {'ego_history' in data.keys()}")
+
+                # 尝试多种访问方式
+                try:
+                    ego_hist_getattr = getattr(data, 'ego_history', None)
+                    print(f"    getattr result: {ego_hist_getattr is not None}")
+                    if ego_hist_getattr is not None:
+                        print(f"    getattr shape: {ego_hist_getattr.shape}")
+                except Exception as e:
+                    print(f"    getattr error: {e}")
+
+                try:
+                    ego_hist_direct = data.ego_history
+                    print(f"    Direct access: {ego_hist_direct is not None}")
+                    if ego_hist_direct is not None:
+                        print(f"    Direct shape: {ego_hist_direct.shape}")
+                except Exception as e:
+                    print(f"    Direct access error: {e}")
+
+            # 保存所有可能的自定义属性
+            custom_attrs = {}
+            attr_names = ['ego_history', 'ego_last_pos', 'gnn_x', 'gnn_edge_index',
+                         'gnn_edge_attr', 'traj_id_to_indices', 'cluster', 'valid_len', 'time_step_len']
+
+            for attr_name in attr_names:
+                if hasattr(data, attr_name):
+                    custom_attrs[attr_name] = getattr(data, attr_name)
+
+            # 设备转移
             data = data.to(device)
+            
+            # 恢复自定义属性
+            for attr_name, attr_value in custom_attrs.items():
+                if not hasattr(data, attr_name):
+                    if isinstance(attr_value, torch.Tensor):
+                        setattr(data, attr_name, attr_value.to(device))
+                    else:
+                        setattr(data, attr_name, attr_value)
+
+            # 添加调试信息 - 在设备转移后立即检查
+            if i == 0:
+                print(f"  [DEVICE TRANSFER DEBUG] After .to(device):")
+                print(f"    hasattr(data, 'ego_history'): {hasattr(data, 'ego_history')}")
+                if hasattr(data, 'ego_history'):
+                    print(f"    ego_history shape: {data.ego_history.shape}")
+                    print(f"    ego_history device: {data.ego_history.device}")
+                else:
+                    print(f"    Saved custom_attrs keys: {list(custom_attrs.keys())}")
+                    print(f"    ego_history was saved: {'ego_history' in custom_attrs}")
+
             output = model(data)
 
-            # ✅ 修复：正确处理批次维度和目标张量形状
-            batch_size = data.y.shape[0]
-            y = data.y.view(batch_size, -1).to(device)  # [batch_size, 60]
+            # Determine batch size based on data.y dimensions
+            if data.y.dim() == 2:
+                batch_size = data.y.shape[0] // 60
+            elif data.y.dim() == 3:
+                batch_size = data.y.shape[0]
+            else:
+                batch_size = 1
 
-            # 确保输出形状匹配
+            pred_increments = output.view(batch_size, 60, 2)
+            true_increments = data.y.view(batch_size, 60, 2)
+
+            # Handle reference origin for trajectory restoration
+            # 修复坐标系不匹配问题 - 改进ego_history检查逻辑
+            reference_origin = torch.zeros(batch_size, 2, device=device)  # 默认值
+            ego_history_found = False
+
+            if hasattr(data, 'ego_history') and data.ego_history.numel() > 0:
+                try:
+                    ego_hist = data.ego_history
+
+                    # 处理不同的批量格式
+                    if ego_hist.dim() == 1:
+                        # 展平的批量: [batch_size*20*2]
+                        expected_size = batch_size * 20 * 2
+                        if ego_hist.shape[0] == expected_size:
+                            ego_hist_reshaped = ego_hist.view(batch_size, 20, 2)
+                            reference_origin = ego_hist_reshaped[:, -1, :]
+                            ego_history_found = True
+                        elif ego_hist.shape[0] == 40:  # 单样本的20*2展平
+                            ego_hist_reshaped = ego_hist.view(20, 2).unsqueeze(0).repeat(batch_size, 1, 1)
+                            reference_origin = ego_hist_reshaped[:, -1, :]
+                            ego_history_found = True
+
+                    elif ego_hist.dim() == 2:
+                        if ego_hist.shape[0] == batch_size * 20 and ego_hist.shape[1] == 2:
+                            # 批量展平: [batch_size*20, 2]
+                            ego_hist_reshaped = ego_hist.view(batch_size, 20, 2)
+                            reference_origin = ego_hist_reshaped[:, -1, :]
+                            ego_history_found = True
+                        elif ego_hist.shape[0] == 20 and ego_hist.shape[1] == 2:
+                            # 单样本: [20, 2]
+                            ego_hist_reshaped = ego_hist.unsqueeze(0).repeat(batch_size, 1, 1)
+                            reference_origin = ego_hist_reshaped[-1, :].unsqueeze(0).expand(batch_size, -1)
+                            ego_history_found = True
+
+                    elif ego_hist.dim() == 3 and ego_hist.shape[0] == batch_size:
+                        # 正确的批量格式: [batch_size, 20, 2]
+                        reference_origin = ego_hist[:, -1, :]
+                        ego_history_found = True
+
+                except Exception as e:
+                    ego_history_found = False
+
+            # 备用：使��ego_last_pos
+            if not ego_history_found and hasattr(data, 'ego_last_pos') and data.ego_last_pos.numel() > 0:
+                # 备用：使用ego_last_pos，但需要检查坐标系
+                if data.ego_last_pos.dim() == 1:
+                    if data.ego_last_pos.shape[0] == batch_size * 2:
+                        reference_origin = data.ego_last_pos.view(batch_size, 2)
+                    elif data.ego_last_pos.shape[0] == 2:
+                        reference_origin = data.ego_last_pos.unsqueeze(0).expand(batch_size, -1)
+                    else:
+                        reference_origin = torch.zeros(batch_size, 2, device=device)
+                elif data.ego_last_pos.dim() == 2 and data.ego_last_pos.shape[0] == batch_size:
+                    reference_origin = data.ego_last_pos
+                else:
+                    reference_origin = torch.zeros(batch_size, 2, device=device)
+            else:
+                reference_origin = torch.zeros(batch_size, 2, device=device)
+
+            pred_trajectory = restore_trajectory_from_increments(reference_origin, pred_increments)
+            true_trajectory = restore_trajectory_from_increments(reference_origin, true_increments)
+
+            increment_error = torch.norm(pred_increments - true_increments, dim=2)
+            avg_increment_error = torch.mean(increment_error, dim=1)
+            increment_errors.extend(avg_increment_error.cpu().numpy())
+
+            if i == 0:
+                print(f"[HISTORY-BASED] Using ego history trajectory for prediction")
+                print(f"  Reference origin sample: [{reference_origin[0, 0]:.2f}, {reference_origin[0, 1]:.2f}]")
+                print(f"  True final position: [{true_trajectory[0, -1, 0]:.2f}, {true_trajectory[0, -1, 1]:.2f}]")
+                print(f"  Pred final position: [{pred_trajectory[0, -1, 0]:.2f}, {pred_trajectory[0, -1, 1]:.2f}]")
+                print(f"  Average increment error: {avg_increment_error[0]:.2f}m")
+
+                # Debug: Show ADE and FDE for first 5 samples in validation batch
+                position_errors = torch.norm(pred_trajectory - true_trajectory, dim=2)
+                sample_ade = torch.mean(position_errors, dim=1)
+                sample_fde = position_errors[:, -1]
+
+                num_debug_samples = min(5, batch_size)
+                print(f"  First {num_debug_samples} samples - ADE/FDE:")
+                for j in range(num_debug_samples):
+                    print(f"    Sample {j+1}: ADE={sample_ade[j]:.2f}m, FDE={sample_fde[j]:.2f}m")
+
+                # Debug: Analyze high-error samples
+                high_error_threshold = 30.0  # FDE > 30m认为是高误差样本
+                high_error_mask = sample_fde > high_error_threshold
+                num_high_error = high_error_mask.sum().item()
+
+                if num_high_error > 0:
+                    print(f"  High-error samples ({num_high_error} samples with FDE > {high_error_threshold}m):")
+                    for j in range(batch_size):
+                        if high_error_mask[j]:
+                            # 分析异常样本的特征
+                            true_traj_sample = true_trajectory[j]  # [60, 2]
+                            pred_traj_sample = pred_trajectory[j]  # [60, 2]
+
+                            # 计算轨迹长度
+                            true_diffs = true_traj_sample[1:] - true_traj_sample[:-1]
+                            true_speeds = torch.norm(true_diffs, dim=1)
+                            true_total_distance = torch.sum(true_speeds)
+
+                            # 计算方向变化
+                            true_directions = true_diffs / (torch.norm(true_diffs, dim=1, keepdim=True) + 1e-8)
+                            direction_changes = torch.acos(torch.clamp(
+                                torch.sum(true_directions[:-1] * true_directions[1:], dim=1), -1, 1
+                            ))
+                            avg_direction_change = torch.mean(direction_changes) * 180 / 3.14159  # 转换为度
+
+                            print(f"    Sample {j+1}: FDE={sample_fde[j]:.2f}m, TotalDist={true_total_distance:.1f}m, "
+                                  f"AvgDirChange={avg_direction_change:.1f}°, MaxSpeed={true_speeds.max():.2f}m/s")
+
+                print(f"  Batch statistics: ADE range=[{sample_ade.min():.2f}, {sample_ade.max():.2f}]m")
+                print(f"  Batch statistics: FDE range=[{sample_fde.min():.2f}, {sample_fde.max():.2f}]m")
+
+                # Debug: Show actual increment values with detailed statistics
+                true_inc_norms = torch.norm(true_increments[0], dim=1)
+                pred_inc_norms = torch.norm(pred_increments[0], dim=1)
+                print(f"  True increment norm: {true_inc_norms.mean():.2f}m (std={true_inc_norms.std():.3f})")
+                print(f"  Pred increment norm: {pred_inc_norms.mean():.2f}m (std={pred_inc_norms.std():.3f})")
+                print(f"  True increment range: [{true_inc_norms.min():.3f}, {true_inc_norms.max():.3f}]")
+                print(f"  First 5 true increments: {true_increments[0][:5]}")
+
+                # Debug ego history usage
+                print(f"  [DEBUG] hasattr(data, 'ego_history'): {hasattr(data, 'ego_history')}")
+                if hasattr(data, 'ego_history'):
+                    print(f"  [DEBUG] data.ego_history type: {type(data.ego_history)}")
+                    print(f"  [DEBUG] data.ego_history.numel(): {data.ego_history.numel()}")
+                    print(f"  [DEBUG] data.ego_history.shape: {data.ego_history.shape}")
+
+                if hasattr(data, 'ego_history') and data.ego_history.numel() > 0:
+                    ego_hist = data.ego_history
+                    print(f"  [DEBUG] Processing ego_history with shape: {ego_hist.shape}, batch_size: {batch_size}")
+
+                    # Handle different batch formats - 修复批处理格式检测
+                    if ego_hist.dim() == 2:
+                        # 批处理格式: [batch_size*20, 2] 或 [batch_size, 20*2]
+                        if ego_hist.shape[0] == batch_size * 20 and ego_hist.shape[1] == 2:
+                            # 格式: [batch_size*20, 2] -> [batch_size, 20, 2]
+                            ego_hist_reshaped = ego_hist.view(batch_size, 20, 2)
+                        elif ego_hist.shape[0] == batch_size and ego_hist.shape[1] == 40:
+                            # 格式: [batch_size, 40] -> [batch_size, 20, 2]
+                            ego_hist_reshaped = ego_hist.view(batch_size, 20, 2)
+                        else:
+                            ego_hist_reshaped = ego_hist
+                    elif ego_hist.dim() == 3:
+                        # Already correct format [batch_size, 20, 2]
+                        ego_hist_reshaped = ego_hist
+                    elif ego_hist.dim() == 1:
+                        # Flattened batch: [batch_size*20*2]
+                        expected_size = batch_size * 20 * 2
+                        if ego_hist.shape[0] == expected_size:
+                            ego_hist_reshaped = ego_hist.view(batch_size, 20, 2)
+                        else:
+                            ego_hist_reshaped = ego_hist.view(-1, 2)
+                    else:
+                        ego_hist_reshaped = ego_hist.view(-1, 2)
+
+                    print(f"  [DEBUG] ego_hist_reshaped.shape: {ego_hist_reshaped.shape}")
+
+                    if ego_hist_reshaped.dim() == 3 and ego_hist_reshaped.shape[1] == 20:
+                        # Calculate statistics for first sample
+                        first_sample_hist = ego_hist_reshaped[0]  # [20, 2]
+                        ego_hist_norms = torch.norm(first_sample_hist, dim=1)
+                        non_zero_count = (ego_hist_norms > 0.001).sum().item()
+                        print(f"  Ego history: shape={ego_hist.shape}, batch_shape={ego_hist_reshaped.shape}")
+                        print(f"  Ego history non_zero_steps={non_zero_count}/20, norm_mean={ego_hist_norms.mean():.3f}m")
+                    else:
+                        ego_hist_norms = torch.norm(ego_hist_reshaped, dim=-1 if ego_hist_reshaped.dim() > 1 else 0)
+                        non_zero_count = (ego_hist_norms > 0.001).sum().item()
+                        print(f"  Ego history: shape={ego_hist.shape}, reshaped={ego_hist_reshaped.shape}, non_zero_steps={non_zero_count}")
+                else:
+                    print("  Ego history: NOT FOUND - model using fallback features")
+
+            y_flat = data.y.view(batch_size, -1)
             if output.shape[0] != batch_size:
-                # 如果模型输出的批次维度不匹配，需要调整
                 output = output.expand(batch_size, -1)
 
-            loss = criterion(output, y)
+            loss = criterion(output, y_flat)
             val_loss += loss.item() * batch_size
 
-            # ✅ 修正的ADE/FDE计算：先还原为绝对轨迹
-            pred_increments = output.view(batch_size, -1, 2)  # [batch, time_steps, 2]
-            true_increments = y.view(batch_size, -1, 2)
-
-            # 起始位置为原点
-            origin = torch.zeros(batch_size, 2, device=device)
-
-            # 还原为绝对轨迹
-            pred_absolute = restore_trajectory_from_increments(origin, pred_increments)
-            true_absolute = restore_trajectory_from_increments(origin, true_increments)
-
-            # 计算绝对轨迹的ADE和FDE
-            displacement_errors = torch.norm(pred_absolute - true_absolute, dim=2)  # [batch, time_steps]
-            ade = torch.mean(displacement_errors, dim=1)  # [batch]
-            fde = displacement_errors[:, -1]  # [batch]
+            position_errors = torch.norm(pred_trajectory - true_trajectory, dim=2)
+            ade = torch.mean(position_errors, dim=1)
+            fde = position_errors[:, -1]
 
             ade_list.extend(ade.cpu().numpy())
             fde_list.extend(fde.cpu().numpy())
-
             num_samples += batch_size
 
     model.train()
     avg_ade = sum(ade_list) / len(ade_list) if ade_list else 0
     avg_fde = sum(fde_list) / len(fde_list) if fde_list else 0
+    avg_increment_error = sum(increment_errors) / len(increment_errors) if increment_errors else 0
+
+    print(f"  Validation summary: Avg increment error={avg_increment_error:.2f}m")
+
     return val_loss / num_samples, avg_ade, avg_fde
 
 
 class EarlyStopping:
-    """Early stopping utility class"""
-    def __init__(self, patience=10, min_delta=0.001, restore_best_weights=True):
+    """Early stopping utility to prevent overfitting."""
+
+    def __init__(self, patience: int = 10, min_delta: float = 0.001, restore_best_weights: bool = True):
         self.patience = patience
         self.min_delta = min_delta
         self.restore_best_weights = restore_best_weights
@@ -224,12 +513,12 @@ class EarlyStopping:
         self.counter = 0
         self.best_weights = None
 
-    def __call__(self, val_loss, model):
+    def __call__(self, val_loss: float, model: nn.Module) -> bool:
         if val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
             self.counter = 0
             if self.restore_best_weights:
-                self.best_weights = model.state_dict().copy()
+                self.best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             self.counter += 1
 
@@ -240,28 +529,131 @@ class EarlyStopping:
         return False
 
 
-if __name__ == '__main__':
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+class ImprovedTrajectoryLoss(nn.Module):
+    """Improved trajectory loss combining multiple error metrics."""
 
-    # 🔍 DEBUG: 打印配置文件路径
+    def __init__(self, ade_weight: float = 1.0, fde_weight: float = 2.0,
+                 smoothness_weight: float = 0.5, direction_weight: float = 0.3):
+        super().__init__()
+        self.ade_weight = ade_weight
+        self.fde_weight = fde_weight
+        self.smoothness_weight = smoothness_weight
+        self.direction_weight = direction_weight
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, return_components: bool = False):
+        # Handle different input shapes
+        if target.dim() == 2:
+            if target.shape[1] == 2:
+                batch_size = target.shape[0] // 60
+                target = target.view(batch_size, 60, 2)
+            elif target.shape[1] == 120:
+                batch_size = target.shape[0]
+                target = target.view(batch_size, 60, 2)
+            else:
+                raise ValueError(f"Unexpected target shape: {target.shape}")
+        elif target.dim() == 3:
+            batch_size = target.shape[0]
+        else:
+            raise ValueError(f"Unexpected target shape: {target.shape}")
+
+        pred_traj = pred.view(batch_size, 60, 2)
+        true_traj = target
+
+        # ADE Loss (Average Displacement Error)
+        displacement_errors = torch.norm(pred_traj - true_traj, dim=2)
+        ade_loss = torch.mean(displacement_errors)
+
+        # FDE Loss (Final Displacement Error) - emphasize final position
+        fde_loss = torch.norm(pred_traj[:, -1, :] - true_traj[:, -1, :], dim=1).mean()
+
+        # Smoothness Loss - penalize abrupt changes in trajectory
+        pred_diffs = pred_traj[:, 1:, :] - pred_traj[:, :-1, :]
+        true_diffs = true_traj[:, 1:, :] - true_traj[:, :-1, :]
+        smoothness_loss = torch.mean(torch.norm(pred_diffs - true_diffs, dim=2))
+
+        # Direction Loss - preserve overall trajectory direction
+        pred_direction = pred_traj[:, -1, :] - pred_traj[:, 0, :]
+        true_direction = true_traj[:, -1, :] - true_traj[:, 0, :]
+
+        # Normalize directions to unit vectors
+        pred_direction_norm = torch.norm(pred_direction, dim=1, keepdim=True)
+        true_direction_norm = torch.norm(true_direction, dim=1, keepdim=True)
+
+        # Avoid division by zero
+        pred_direction_norm = torch.clamp(pred_direction_norm, min=1e-8)
+        true_direction_norm = torch.clamp(true_direction_norm, min=1e-8)
+
+        pred_direction_unit = pred_direction / pred_direction_norm
+        true_direction_unit = true_direction / true_direction_norm
+
+        # Cosine similarity loss (1 - cosine similarity)
+        cosine_sim = torch.sum(pred_direction_unit * true_direction_unit, dim=1)
+        direction_loss = torch.mean(1 - cosine_sim)
+
+        # Combined loss
+        total_loss = (self.ade_weight * ade_loss +
+                     self.fde_weight * fde_loss +
+                     self.smoothness_weight * smoothness_loss +
+                     self.direction_weight * direction_loss)
+
+        if return_components:
+            return {
+                'total_loss': total_loss,
+                'ade_loss': ade_loss,
+                'fde_loss': fde_loss,
+                'smoothness_loss': smoothness_loss,
+                'direction_loss': direction_loss,
+                'weighted_ade': self.ade_weight * ade_loss,
+                'weighted_fde': self.fde_weight * fde_loss,
+                'weighted_smoothness': self.smoothness_weight * smoothness_loss,
+                'weighted_direction': self.direction_weight * direction_loss
+            }
+
+        return total_loss
+
+
+if __name__ == '__main__':
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+
     print(f"[DEBUG] Using config.py from: {config.__file__}")
     print(f"[DEBUG] TRAIN_PATH = {config.TRAIN_PATH}")
     dataset_pt_path = os.path.join(config.TRAIN_PATH, "processed", "dataset.pt")
     print(f"[DEBUG] dataset.pt exists? {os.path.exists(dataset_pt_path)}")
-    print(f"📁 Using TRAIN_PATH: {config.TRAIN_PATH}")
+    print(f"Using TRAIN_PATH: {config.TRAIN_PATH}")
+
+    # 强制验证数据集类型
+    print(f"[DEBUG] Importing GraphDataset from: {GraphDataset.__module__}")
 
     full_dataset = GraphDataset(config.TRAIN_PATH)
-    print(f"📊 Loaded dataset with {len(full_dataset)} samples")
+    print(f"Loaded dataset with {len(full_dataset)} samples")
 
-    # 🔧 临时数据量限制 - 用于快速测试
-    USE_SMALL_DATASET = True  # 设置为False使用完整数据集
-    SMALL_DATASET_SIZE = 1000  # 使用1000个样本进行快速测试
+    # 验证数据集是否包含ego_history
+    test_sample = full_dataset[0]
+    print(f"[DEBUG] Test sample type: {type(test_sample)}")
+    print(f"[DEBUG] Test sample keys: {list(test_sample.keys())}")
+    print(f"[DEBUG] Test sample has ego_history: {hasattr(test_sample, 'ego_history')}")
+
+    if not hasattr(test_sample, 'ego_history'):
+        print("[ERROR] Dataset does not contain ego_history! Regenerating...")
+        # 删除所有processed文件并重新生成
+        import shutil
+        processed_dir = os.path.join(config.TRAIN_PATH, "processed")
+        if os.path.exists(processed_dir):
+            shutil.rmtree(processed_dir)
+        full_dataset = GraphDataset(config.TRAIN_PATH)
+        test_sample = full_dataset[0]
+        print(f"[DEBUG] After regeneration - has ego_history: {hasattr(test_sample, 'ego_history')}")
+    else:
+        print(f"[SUCCESS] Dataset contains ego_history with shape: {test_sample.ego_history.shape}")
+
+    USE_SMALL_DATASET = False  # 改为False使用完整数据集
+    SMALL_DATASET_SIZE = 1000
 
     if USE_SMALL_DATASET and len(full_dataset) > SMALL_DATASET_SIZE:
-        print(f"🧪 Using small dataset for quick testing: {SMALL_DATASET_SIZE} samples")
+        print(f"Using small dataset for quick testing: {SMALL_DATASET_SIZE} samples")
         small_indices = list(range(min(SMALL_DATASET_SIZE, len(full_dataset))))
         full_dataset = Subset(full_dataset, small_indices)
-        print(f"📊 Reduced dataset size: {len(full_dataset)} samples")
+        print(f"Reduced dataset size: {len(full_dataset)} samples")
 
     indices = list(range(len(full_dataset)))
     train_indices, val_indices = train_test_split(indices, test_size=config.VALIDATION_SPLIT, random_state=config.SEED)
@@ -272,38 +664,41 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE)
 
     model = TransformerPredictor().to(device)
-    criterion = nn.MSELoss()
 
-    # 🔧 降低学习率并改进学习率调度
-    initial_lr = 0.0001  # 从0.001降至0.0001
-    optimizer = optim.Adam(model.parameters(), lr=initial_lr, weight_decay=1e-5)
-
-    # 使用ReduceLROnPlateau调度器，当验证损失停止改善时自动降低学习率
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-6
+    criterion = ImprovedTrajectoryLoss(
+        ade_weight=0.5,           # ADE权重
+        fde_weight=3.0,           # 提高FDE权重，更注重最终位置
+        smoothness_weight=0.3,    # 平滑度权重
+        direction_weight=0.5      # 方向一致性权重
     )
 
-    # 🛑 添加早停机制
+    # Increase initial learning rate for better convergence
+    initial_lr = 5e-4  # Increased from 1e-5 to 5e-4
+    optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=1e-3, betas=(0.9, 0.999))
+
+    # More aggressive learning rate scheduling
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.7, patience=3, verbose=True, min_lr=1e-6
+    )
+
     early_stopping = EarlyStopping(patience=15, min_delta=0.001)
 
     os.makedirs(config.WEIGHT_PATH, exist_ok=True)
     best_val_loss = float('inf')
     train_loss_list, val_loss_list = [], []
-    lr_list = []  # 记录学习率变化
-    ade_list, fde_list = [], []  # 新增：记录ADE和FDE历史
+    lr_list = []
+    ade_list, fde_list = [], []
+    loss_components_history = []  # 用于记录每个epoch的损失组成部分
 
-    # 选择邻接矩阵配置
     adjacency_config = select_adjacency_config_for_training()
     set_adjacency_config_for_training(adjacency_config)
 
-    # 创建训练文件夹
     folders = create_training_folders(adjacency_config, len(train_dataset), config.BATCH_SIZE, initial_lr)
 
-    # 设置日志记录
     log_file_path = os.path.join(folders['logs'], 'training_log.txt')
     logger = setup_logging(log_file_path)
 
-    logger.info(f"🚀 Starting training with improved settings:")
+    logger.info(f"Starting training with history-based architecture:")
     logger.info(f"   - Initial learning rate: {initial_lr}")
     logger.info(f"   - Early stopping patience: 15 epochs")
     logger.info(f"   - Validation every epoch")
@@ -315,8 +710,7 @@ if __name__ == '__main__':
     logger.info(f"   - Batch size: {config.BATCH_SIZE}")
     logger.info("=" * 70)
 
-    # 创建总体进度条
-    epoch_pbar = tqdm(range(config.EPOCHS), desc="Training Progress", position=0)
+    epoch_pbar = tqdm(range(config.EPOCHS), desc="Training Progress")
 
     for epoch in epoch_pbar:
         model.train()
@@ -324,14 +718,7 @@ if __name__ == '__main__':
         num_samples = 0
         start_time = time.time()
 
-        # 为每个epoch创建详细的batch进度条
-        batch_pbar = tqdm(train_loader,
-                         desc=f"Epoch {epoch + 1:3d}",
-                         position=1,
-                         leave=False,
-                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
-
-        for i, data in enumerate(batch_pbar):
+        for i, data in enumerate(train_loader):
             data = data.to(device)
 
             if i == 0 and epoch == 0:
@@ -339,21 +726,40 @@ if __name__ == '__main__':
                 print(f"[DEBUG] Expected output shape: [batch_size, {config.OUT_CHANNELS}]")
 
             output = model(data)
-            batch_size = data.y.shape[0]
+
+            if data.y.dim() == 2:
+                batch_size = data.y.shape[0] // 60
+            elif data.y.dim() == 3:
+                batch_size = data.y.shape[0]
+            else:
+                batch_size = 1
+
             y = data.y.view(batch_size, -1).to(device)
 
             if output.shape[0] != batch_size:
-                output = output.expand(batch_size, -1)
+                if output.shape[0] == 1:
+                    output = output.repeat(batch_size, 1)
+                else:
+                    output = output[:batch_size]
 
             if i == 0 and epoch == 0:
                 print(f"[DEBUG] model output shape: {output.shape}")
                 print(f"[DEBUG] target y shape: {y.shape}")
 
             optimizer.zero_grad()
+            # 记录损失组成部分 - 在训练时也记录
+            with torch.no_grad():
+                sample_output = output[:1]  # 取第一个样本
+                sample_y = y[:1]
+                components = criterion.forward(sample_output, sample_y, return_components=True)
+
+                if i == 0:  # 第一个batch时打印损失组成
+                    print(f"  Loss components - ADE: {components['ade_loss']:.4f}, FDE: {components['fde_loss']:.4f}")
+                    print(f"  Weighted - ADE: {components['weighted_ade']:.4f}, FDE: {components['weighted_fde']:.4f}")
+
             loss = criterion(output, y)
             loss.backward()
 
-            # 添加梯度裁剪防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             optimizer.step()
@@ -361,91 +767,75 @@ if __name__ == '__main__':
             epoch_loss += loss.item() * batch_size
             num_samples += batch_size
 
-            # 更新batch进度条显示当前loss
-            if i % 10 == 0:  # 每10个batch更新一次显示
-                current_avg_loss = epoch_loss / num_samples
-                batch_pbar.set_postfix({
-                    'Loss': f'{current_avg_loss:.6f}',
-                    'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
-                })
-
-        batch_pbar.close()
-
         avg_loss = epoch_loss / num_samples
         train_loss_list.append(avg_loss)
 
-        # 记录当前学习率
         current_lr = optimizer.param_groups[0]['lr']
         lr_list.append(current_lr)
 
-        # 🔄 每个epoch都进行验证
-        print(f"\n📊 Running validation for epoch {epoch + 1}...")
+        print(f"\nRunning validation for epoch {epoch + 1}...")
         val_loss, avg_ade, avg_fde = validate(model, val_loader, criterion, device)
         val_loss_list.append(val_loss)
-        ade_list.append(avg_ade)  # 保存ADE到历史记录
-        fde_list.append(avg_fde)  # 保存FDE到历史记录
+        ade_list.append(avg_ade)
+        fde_list.append(avg_fde)
 
-        # 更新学习率调度器
         scheduler.step(val_loss)
 
-        # 计算epoch耗时
         epoch_time = time.time() - start_time
 
-        # 详细的epoch结果显示
-        print(f"✅ Epoch {epoch + 1:3d}/{config.EPOCHS} Results:")
-        print(f"   📈 Train Loss: {avg_loss:.6f}")
-        print(f"   📉 Val Loss:   {val_loss:.6f}")
-        print(f"   🎯 ADE:        {avg_ade:.4f} meters")
-        print(f"   🎯 FDE:        {avg_fde:.4f} meters")
-        print(f"   ⚡ Learning Rate: {current_lr:.2e}")
-        print(f"   ⏱️  Time:      {epoch_time:.1f}s")
-
-        # 更新总进度条
         epoch_pbar.set_postfix({
-            'Best_Val': f'{best_val_loss:.6f}',
-            'Current_Val': f'{val_loss:.6f}',
-            'ADE': f'{avg_ade:.4f}m'
+            'Train_Loss': f'{avg_loss:.4f}',
+            'Val_Loss': f'{val_loss:.4f}',
+            'ADE': f'{avg_ade:.2f}m',
+            'FDE': f'{avg_fde:.2f}m',
+            'LR': f'{current_lr:.2e}',
+            'Time': f'{epoch_time:.1f}s'
         })
 
-        # 保存最佳模型到统一文件夹
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            # 获取当前邻接矩阵配置名称
             adj_config = get_current_adjacency_config()
             best_model_name = f"best_model_{adj_config}.pth"
             torch.save(model.state_dict(), os.path.join(folders['models'], best_model_name))
-            print(f"   💾 🏆 New best model saved! (val_loss: {val_loss:.6f})")
 
-        # 🛑 检查早停条件
         if early_stopping(val_loss, model):
-            print(f"\n🛑 Early stopping triggered at epoch {epoch + 1}")
-            print(f"   Best validation loss: {early_stopping.best_loss:.6f}")
+            print(f"\nEarly stopping triggered at epoch {epoch + 1}")
             epoch_pbar.close()
             break
 
-        # 保存训练进度信息
         estimated_remaining_time = (config.EPOCHS - epoch - 1) * (time.time() - start_time)
         save_progress_info(folders, epoch, config.EPOCHS, avg_loss, val_loss, avg_ade, avg_fde,
                           current_lr, epoch_time, estimated_remaining_time)
 
-        logger.info(f"✅ Epoch {epoch + 1:3d}/{config.EPOCHS} Results:")
-        logger.info(f"   📈 Train Loss: {avg_loss:.6f}")
-        logger.info(f"   📉 Val Loss:   {val_loss:.6f}")
-        logger.info(f"   🎯 ADE:        {avg_ade:.4f} meters")
-        logger.info(f"   🎯 FDE:        {avg_fde:.4f} meters")
-        logger.info(f"   ⚡ Learning Rate: {current_lr:.2e}")
-        logger.info(f"   ⏱️  Time:      {epoch_time:.1f}s")
-        logger.info("-" * 70)
+        # 记录损失组成部分
+        with torch.no_grad():
+            components = criterion.forward(output, y, return_components=True)
+            loss_components_history.append(components)
+
+        logger.info(f"Epoch {epoch + 1:3d}/{config.EPOCHS}: Train={avg_loss:.4f}, Val={val_loss:.4f}, "
+                   f"ADE={avg_ade:.2f}m, FDE={avg_fde:.2f}m, Time={epoch_time:.1f}s")
 
     epoch_pbar.close()
 
-    # 保存最终模型到统一文件夹
     adj_config = get_current_adjacency_config()
     final_model_name = f"final_model_{adj_config}.pth"
     torch.save(model.state_dict(), os.path.join(folders['models'], final_model_name))
-    print(f"🏁 Training complete. Final model saved as: {final_model_name}")
+    print(f"Training complete. Final model saved as: {final_model_name}")
 
-    # 保存详细的训练记录到统一文件夹
+    # Convert loss components history to JSON-serializable format
+    def tensor_to_float(obj):
+        """Convert tensor values to float for JSON serialization"""
+        if isinstance(obj, torch.Tensor):
+            return obj.item() if obj.numel() == 1 else obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: tensor_to_float(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [tensor_to_float(item) for item in obj]
+        return obj
+
+    serializable_loss_components = tensor_to_float(loss_components_history)
+
+    # 保存详细的训练记录，包括损失组成部分
     loss_record_name = f"loss_record_{adj_config}_ep{len(train_loss_list)}_bs{config.BATCH_SIZE}_lr{initial_lr}.json"
     loss_record_path = os.path.join(folders['results'], loss_record_name)
     with open(loss_record_path, 'w') as f:
@@ -453,14 +843,21 @@ if __name__ == '__main__':
             "adjacency_config": adj_config,
             "train_loss": train_loss_list,
             "val_loss": val_loss_list,
-            "ade_history": ade_list,  # 新增：ADE历史数据
-            "fde_history": fde_list,  # 新增：FDE历史数据
+            "ade_history": ade_list,
+            "fde_history": fde_list,
             "learning_rates": lr_list,
+            "loss_components_history": serializable_loss_components,
+            "loss_weights": {
+                "ade_weight": criterion.ade_weight,
+                "fde_weight": criterion.fde_weight,
+                "smoothness_weight": criterion.smoothness_weight,
+                "direction_weight": criterion.direction_weight
+            },
             "best_val_loss": float(best_val_loss),
-            "final_ade": ade_list[-1] if ade_list else None,  # 新增：最终ADE
-            "final_fde": fde_list[-1] if fde_list else None,  # 新增：最终FDE
-            "best_ade": min(ade_list) if ade_list else None,  # 新增：最佳ADE
-            "best_fde": min(fde_list) if fde_list else None,  # 新增：最佳FDE
+            "final_ade": ade_list[-1] if ade_list else None,
+            "final_fde": fde_list[-1] if fde_list else None,
+            "best_ade": min(ade_list) if ade_list else None,
+            "best_fde": min(fde_list) if fde_list else None,
             "epochs_trained": len(train_loss_list),
             "early_stopped": len(train_loss_list) < config.EPOCHS,
             "dataset_size": len(train_dataset),
@@ -471,84 +868,39 @@ if __name__ == '__main__':
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }, f, indent=2)
 
-    print(f"📁 Detailed training record saved to {loss_record_path}")
+    print(f"Detailed training record saved to {loss_record_path}")
 
-    # 绘制改进的loss曲线图并保存到统一文件夹
-    plt.figure(figsize=(15, 5))
+    # 额外保存一个专门的损失组成部分文件，便于分析
+    loss_components_file = os.path.join(folders['results'], f"loss_components_{adj_config}.json")
+    with open(loss_components_file, 'w') as f:
+        json.dump({
+            "loss_weights": {
+                "ade_weight": criterion.ade_weight,
+                "fde_weight": criterion.fde_weight,
+                "smoothness_weight": criterion.smoothness_weight,
+                "direction_weight": criterion.direction_weight
+            },
+            "loss_components_by_epoch": serializable_loss_components,  # 使用已转换的可序列化数据
+            "training_summary": {
+                "total_epochs": len(loss_components_history),
+                "final_epoch_components": serializable_loss_components[-1] if serializable_loss_components else None
+            }
+        }, f, indent=2)
 
-    # 子图1: 损失曲线
-    plt.subplot(1, 3, 1)
-    plt.plot(range(1, len(train_loss_list) + 1), train_loss_list, label='Train Loss', alpha=0.7)
-    plt.plot(range(1, len(val_loss_list) + 1), val_loss_list, label='Val Loss', alpha=0.7)
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title(f'Training/Validation Loss - {adj_config}')  # 添加配置信息到标题
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    print(f"Loss components analysis saved to {loss_components_file}")
 
-    # 子图2: 学习率变化
-    plt.subplot(1, 3, 2)
-    plt.plot(range(1, len(lr_list) + 1), lr_list, label='Learning Rate', color='orange')
-    plt.xlabel('Epoch')
-    plt.ylabel('Learning Rate')
-    plt.title('Learning Rate Schedule')
-    plt.yscale('log')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    # 子图3: 损失差异
-    plt.subplot(1, 3, 3)
-    loss_diff = np.array(val_loss_list) - np.array(train_loss_list[:len(val_loss_list)])
-    plt.plot(range(1, len(loss_diff) + 1), loss_diff, label='Val - Train Loss', color='red')
-    plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss Difference')
-    plt.title('Overfitting Monitor')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plot_name = f"training_analysis_{adj_config}_ep{len(train_loss_list)}_lr{initial_lr}.png"
-    loss_plot_path = os.path.join(folders['plots'], plot_name)
-    plt.savefig(loss_plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"📊 Comprehensive training analysis saved to {loss_plot_path}")
-
-    # 保存训练配置信息到统一文件夹
-    config_info = {
-        "training_info": {
-            "adjacency_config": adj_config,
-            "dataset_size": len(train_dataset),
-            "validation_size": len(val_dataset),
-            "batch_size": config.BATCH_SIZE,
-            "initial_learning_rate": initial_lr,
-            "epochs_planned": config.EPOCHS,
-            "epochs_trained": len(train_loss_list),
-            "early_stopped": len(train_loss_list) < config.EPOCHS,
-            "device": str(device),
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-        },
-        "model_info": {
-            "model_type": "TransformerPredictor",
-            "loss_function": "MSELoss",
-            "optimizer": "Adam",
-            "weight_decay": 1e-5,
-            "early_stopping_patience": 15
-        },
-        "results": {
-            "best_val_loss": float(best_val_loss),
-            "final_train_loss": train_loss_list[-1] if train_loss_list else None,
-            "final_val_loss": val_loss_list[-1] if val_loss_list else None
-        }
-    }
-
-    config_path = os.path.join(folders['logs'], f"training_config_{adj_config}.json")
-    with open(config_path, 'w') as f:
-        json.dump(config_info, f, indent=2)
-
-    print(f"📋 Training configuration saved to {config_path}")
-    print(f"\n🎉 所有训练文件已保存到文件夹: {folders['base']}")
-    print(f"   📂 模型文件: {folders['models']}")
-    print(f"   📊 结果文件: {folders['results']}")
-    print(f"   📈 图表文件: {folders['plots']}")
-    print(f"   📋 日志文件: {folders['logs']}")
+    # 在日志中记录损失函数配置总结
+    logger.info("=" * 70)
+    logger.info("Loss Function Configuration Summary:")
+    logger.info(f"  ADE Loss Weight: {criterion.ade_weight} (Average Displacement Error)")
+    logger.info(f"  FDE Loss Weight: {criterion.fde_weight} (Final Displacement Error)")
+    logger.info(f"  Smoothness Loss Weight: {criterion.smoothness_weight} (Trajectory Smoothness)")
+    logger.info(f"  Direction Loss Weight: {criterion.direction_weight} (Direction Consistency)")
+    if loss_components_history:
+        final_components = loss_components_history[-1]
+        logger.info(f"Final Epoch Loss Components:")
+        logger.info(f"  - ADE: {final_components['ade_loss']:.4f} (weighted: {final_components['weighted_ade']:.4f})")
+        logger.info(f"  - FDE: {final_components['fde_loss']:.4f} (weighted: {final_components['weighted_fde']:.4f})")
+        logger.info(f"  - Smoothness: {final_components['smoothness_loss']:.4f} (weighted: {final_components['weighted_smoothness']:.4f})")
+        logger.info(f"  - Direction: {final_components['direction_loss']:.4f} (weighted: {final_components['weighted_direction']:.4f})")
+    logger.info("=" * 70)

@@ -1,0 +1,27 @@
+defaults:
+  - /default_simulation
+  - _self_
+
+# Open-loop simulation configuration for GNN_Trans evaluation
+experiment_name: 'open_loop_gnn_trans'
+
+# Use open-loop controller (no vehicle dynamics simulation)
+ego_controller: perfect_tracking_controller
+
+# Observation setup for trajectory prediction
+observation: idm_agents_observation
+
+# Simulation time controller for open-loop evaluation
+simulation_time_controller: step_simulation_time_controller
+
+# Metrics for trajectory prediction evaluation
+simulation_metric:
+  - ego_displacement_metrics
+  - ego_acceleration_metrics
+  - ego_jerk_metrics
+  - ego_speed_metrics
+  - ego_yaw_acceleration_metrics
+  - ego_yaw_rate_metrics
+
+# Enable progress tracking
+enable_simulation_progress_bar: true

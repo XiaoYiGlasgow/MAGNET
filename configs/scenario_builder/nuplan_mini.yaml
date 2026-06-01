@@ -1,0 +1,14 @@
+_target_: nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder.NuPlanScenarioBuilder
+_convert_: 'all'
+
+# Dataset configuration
+data_root: null
+map_root: null
+sensor_root: null
+db_files: null
+map_version: "nuplan-maps-v1.0"
+
+max_workers: null
+verbose: ${verbose}
+
+include_cameras: false

@@ -1,0 +1,65 @@
+# Simple simulation configuration for GNN_Trans smoke testing
+
+hydra:
+  run:
+    dir: ${output_dir}
+  output_subdir: ${output_dir}/code/hydra
+  searchpath:
+    - pkg://nuplan.planning.script.config.common
+    - pkg://nuplan.planning.script.config.simulation
+
+defaults:
+  # Base configs (non-override, order matters)
+  - default_experiment           # max_number_of_workers, seed, enable_profiling, etc.
+  - default_common               # distributed_timeout_seconds, distribute_by_scenario, etc.
+                                 # Also loads: worker=ray_distributed, scenario_builder=nuplan_mini,
+                                 #             scenario_filter=one_continuous_log
+  - /planner: gnn_trans_local_planner
+  - /splitter: nuplan
+  - /callback: simulation_log_callback
+  - /ego_controller: perfect_tracking_controller
+  - /observation: box_observation
+  - /simulation_time_controller: step_simulation_time_controller
+  # Overrides must come after all non-override entries
+  - override /worker: sequential
+  - override /scenario_filter: all_scenarios
+  - _self_
+
+# Override scenario builder paths
+scenario_builder:
+  data_root: "/mnt/local/Xiao_Yi/nuplan-devkit/nuplan/dataset/nuplan-v1.1/splits/train_pittsburgh"
+  map_root: "/mnt/local/Xiao_Yi/nuplan-devkit/nuplan/dataset/maps"
+
+# Limit scenarios for smoke test
+scenario_filter:
+  num_scenarios_per_type: 1
+  limit_total_scenarios: 2
+
+# Output
+output_dir: "/mnt/local/Xiao_Yi/gnn_trans_simulation_results"
+experiment_name: "gnn_trans_planner_test"
+job_name: "smoke_test"
+
+# Keys from default_simulation.yaml (not provided by default_experiment / default_common)
+simulation_history_buffer_duration: 2.0
+disable_callback_parallelization: true
+distributed_mode: 'SINGLE_NODE'
+number_of_gpus_allocated_per_simulation: 0
+number_of_cpus_allocated_per_simulation: 1
+run_metric: false
+simulation_log_main_path: null
+exit_on_failure: false
+max_callback_workers: 1
+aggregated_metric_folder_name: 'aggregator_metric'
+aggregator_save_path: "/mnt/local/Xiao_Yi/gnn_trans_simulation_results/aggregator_metric"
+metric_dir: metrics
+aggregator_metric_dir: aggregator_metric
+runner_report_file: runner_report.parquet
+log_config: false
+enable_simulation_progress_bar: false
+
+# No main callbacks for local smoke testing
+main_callback: {}
+
+seed: 0
+verbose: true
