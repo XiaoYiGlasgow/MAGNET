@@ -42,15 +42,22 @@ result_transformer/
 *.jpg
 *.jpeg
 
-# Backup source files
-*backup*.py
-*.backup
-
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Local assistant state
+.claude/
+.code-graph/
+
+# Internal docs / notes
+docs/archive/
+docs/work_records/archive/*.html
+docs/folder_cleanup_plan.md
+docs/reports/danger_scene_generation_report.html
+docs/reports/danger_scene_generation_talk.md
 
 # OS
 .DS_Store
@@ -58,3 +65,31 @@ Thumbs.db
 
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# Large local-only project areas
+archive/*
+!archive/README.md
+data/*
+!data/README.md
+experiments/*
+!experiments/README.md
+outputs/*
+!outputs/README.md
+TTC_filter
+Nuboard
+baselines
+config
+danger_pair_reports
+diffusion_danger_model
+diffusion_training_experiments
+diffusion_visualization_results
+models
+model_weights
+planner
+trajectory_visualization
+utils
+visualization
+
+# Keep ablation code, ignore generated artifacts
+danger_gen_ablation/__pycache__/
+danger_gen_ablation/results/

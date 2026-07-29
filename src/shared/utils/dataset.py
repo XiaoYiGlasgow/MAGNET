@@ -125,6 +125,7 @@ def get_adjacency_config(config_name="default"):
 
     class NearbyOnlyBuilder:
         def build_adjacency_matrix(self, subgraph_vectors, subgraph_types, distance_threshold=30.0):
+            # nearby_only 阈值=30m（E0 固定；E4 再扫 5/10/15/20/30m 做拓扑消融）
             nodes = list(subgraph_vectors.keys())
             edges = []
             edge_types = []
@@ -178,6 +179,32 @@ def get_adjacency_config(config_name="default"):
 
             return {'nodes': nodes, 'edges': edges, 'edge_types': edge_types}
 
+    class TypedRelationalBuilder:
+        """关系型语义边构建器（#2 R-GCN 用）：拓扑与 DefaultBuilder 完全一致（全连接、无距离
+        过滤），**仅**给每条边打真语义关系类型 —— 由节点 type('ego'/'agent'/'lane')决定，供子类
+        RGCNConv 消费。GCN 基线忽略 edge_types、R-GCN 消费之，故 GCN-vs-RGCN 在同一拓扑上隔离出
+        "关系型消息传递"净增益（RQ2）。父类 GCN 与 danger 线不读 edge_attr → 零风险。
+        关系编码：ego-agent=0, ego-lane=1, agent-agent=2, agent-lane=3, lane-lane=4, other=5（num_relations=6）。"""
+        _TYPE_ID = {'ego': 0, 'agent': 1, 'lane': 2}
+        _PAIR_TO_REL = {(0, 1): 0, (0, 2): 1, (1, 1): 2, (1, 2): 3, (2, 2): 4, (0, 0): 5}
+
+        def _rel(self, t1, t2):
+            a, b = self._TYPE_ID.get(t1, 1), self._TYPE_ID.get(t2, 1)
+            lo, hi = (a, b) if a <= b else (b, a)
+            return self._PAIR_TO_REL.get((lo, hi), 5)
+
+        def build_adjacency_matrix(self, subgraph_vectors, subgraph_types):
+            nodes = list(subgraph_vectors.keys())
+            edges, edge_types = [], []
+            for i in range(len(nodes)):
+                for j in range(i + 1, len(nodes)):
+                    node_i, node_j = nodes[i], nodes[j]
+                    edges.append((node_i, node_j))
+                    edge_types.append(self._rel(
+                        subgraph_types.get(node_i, 'agent'),
+                        subgraph_types.get(node_j, 'agent')))
+            return {'nodes': nodes, 'edges': edges, 'edge_types': edge_types}
+
     # 根据配置返回相应的Builder
     if config_name == "default":
         return DefaultBuilder()
@@ -189,6 +216,8 @@ def get_adjacency_config(config_name="default"):
         return NearbyOnlyBuilder()
     elif config_name == "selective":
         return SelectiveBuilder()
+    elif config_name == "typed_relational":
+        return TypedRelationalBuilder()
     else:
         return DefaultBuilder()
 
@@ -283,6 +312,145 @@ class GraphData(Data):
         return keys + custom_keys
 
 
+def build_graph_data_from_feature_df(data, adjacency_config="default"):
+    """从单条 feature DataFrame 构建一个 GraphData（离线 process() 与在线 planner 共用）。
+
+    `data` 为单行 DataFrame，列 = encoding_vectornet_features 的产出
+    （POLYLINE_FEATURES / GROUND_TRUTH / TRAJ_ID_TO_INDICES / LANE_ID_TO_INDICES /
+    SUBGRAPH_ID_TO_NODE_INDICES / SUBGRAPH_ID_TO_TYPE / EGO_LAST_POS / EGO_HISTORY）。
+    离线读 pkl 得到它、在线 encoding_vectornet_features 直接返回它，二者走同一转换，
+    保证在线 planner 的图（gnn_x 均值池化 + DefaultBuilder 无向补反向 + cluster col9）
+    与训练逐字段一致。
+
+    :param data: 单行 pandas DataFrame（.values[0] 取值）
+    :param adjacency_config: 邻接矩阵配置名（对齐训练 best_model_default.pth 的 "default"）
+    :return: (GraphData 或 None, skip_reason 或 None)；skip_reason ∈ {'empty_traj','no_polylines'}
+    """
+    features = data['POLYLINE_FEATURES'].values[0].astype(np.float32)
+    cluster = features[:, 9].astype(np.int64)  # col9=subgraph_ID（原 -1=col11 end_time 取错列）
+    y = data['GROUND_TRUTH'].values[0].astype(np.float32)
+
+    # 确保Ground Truth是2维数组 (60, 2)
+    if y.ndim == 3 and y.shape[0] == 1:
+        y = y.squeeze(0)
+    assert y.ndim == 2 and y.shape[1] == 2, f"Ground Truth维度错误: 期望(N, 2), 实际{y.shape}"
+
+    traj_id_dict = data['TRAJ_ID_TO_INDICES'].values[0]
+    lane_id_dict = data['LANE_ID_TO_INDICES'].values[0]
+
+    if len(traj_id_dict) == 0 and len(lane_id_dict) == 0:
+        return None, 'empty_traj'
+
+    x_list, edge_list, cluster_list = [], [], []
+    cluster_id = 0
+
+    # Process trajectory polylines
+    for polyline_id, (start, end) in traj_id_dict.items():
+        if end < start:
+            continue
+        traj = features[start:end + 1]
+        if traj.shape[0] < 2:
+            continue
+
+        x_list.append(traj)
+        edge_index = get_sequential_edge_index(len(traj), start)
+        if edge_index.ndim == 2 and edge_index.shape[1] > 0:
+            edge_list.append(edge_index)
+            cluster_list.append(cluster_id)
+            cluster_id += 1
+
+    # Process lane polylines
+    if len(lane_id_dict) > 0:
+        lane_offset = max(end for _, end in traj_id_dict.values()) + 1 if len(traj_id_dict) > 0 else 0
+        for lane_id, (start, end) in lane_id_dict.items():
+            if end < start:
+                continue
+            lane = features[lane_offset + start: lane_offset + end + 1]
+            if lane.shape[0] < 2:
+                continue
+
+            x_list.append(lane)
+            edge_index = get_sequential_edge_index(len(lane), lane_offset + start)
+            if edge_index.ndim == 2 and edge_index.shape[1] > 0:
+                edge_list.append(edge_index)
+                cluster_list.append(cluster_id)
+                cluster_id += 1
+
+    if len(x_list) == 0:
+        return None, 'no_polylines'
+
+    x_combined = np.vstack(x_list)
+    edge_combined = np.hstack(edge_list) if len(edge_list) > 0 else np.zeros((2, 0), dtype=np.int64)
+    traj_tensor = torch.zeros(1, 3, dtype=torch.long)
+
+    # 处理GNN数据
+    pooled_tensor = torch.zeros(1, 12)
+    edge_index_gnn = torch.zeros(2, 0, dtype=torch.long)
+    edge_attr_gnn = torch.zeros(0, dtype=torch.long)
+
+    if 'SUBGRAPH_ID_TO_NODE_INDICES' in data.columns:
+        try:
+            subgraph_id_to_indices = data['SUBGRAPH_ID_TO_NODE_INDICES'].values[0]
+            subgraph_id_to_types = data['SUBGRAPH_ID_TO_TYPE'].values[0]
+            pooled_dict = subgraph_pooling(features, subgraph_id_to_indices)
+
+            custom_builder = get_adjacency_config(adjacency_config)
+            gnn_graph = build_graph_from_subgraphs(
+                pooled_dict,
+                subgraph_id_to_types,
+                distance_threshold=30.0,
+                adjacency_builder=custom_builder
+            )
+
+            if len(gnn_graph['nodes']) > 0:
+                pooled_tensor = torch.tensor([pooled_dict[i] for i in gnn_graph['nodes']], dtype=torch.float)
+                if len(gnn_graph['edges']) > 0:
+                    directed = np.array(gnn_graph['edges']).T                              # [2, E] builder 存单向 i<j
+                    # 决策B：无向边补反向（GCN 需对称邻接）
+                    mapped_edges = np.concatenate([directed, directed[[1, 0], :]], axis=1)  # [2, 2E]
+                    edge_index_gnn = torch.tensor(mapped_edges, dtype=torch.long)
+                    # edge_attr 与双向边一一对应（原 [:len(mapped_edges)]=[:2] 把 E 条错截成 2 条）
+                    edge_types_sym = gnn_graph['edge_types'] + gnn_graph['edge_types']      # 长 2E，前正向后反向
+                    edge_attr_gnn = torch.tensor(edge_types_sym, dtype=torch.long)
+                    assert edge_index_gnn.shape[1] == edge_attr_gnn.shape[0], \
+                        f"edge_index({edge_index_gnn.shape[1]}) 与 edge_attr({edge_attr_gnn.shape[0]}) 长度不一致"
+        except Exception as e:
+            print(f"Warning: GNN data processing failed: {e}")
+
+    # 处理ego_last_pos
+    ego_last_pos = np.zeros(2, dtype=np.float32)
+    if 'EGO_LAST_POS' in data.columns:
+        ego_last_pos_raw = data['EGO_LAST_POS'].values[0]
+        if ego_last_pos_raw is not None:
+            if isinstance(ego_last_pos_raw, (list, tuple)):
+                ego_last_pos = np.array(ego_last_pos_raw, dtype=np.float32)[:2]
+            elif isinstance(ego_last_pos_raw, np.ndarray):
+                ego_last_pos = ego_last_pos_raw.astype(np.float32)[:2]
+
+    # 提取EGO_HISTORY数据
+    ego_history_data = None
+    if 'EGO_HISTORY' in data.columns:
+        ego_history_raw = data['EGO_HISTORY'].values[0]
+        if ego_history_raw is not None and isinstance(ego_history_raw, np.ndarray):
+            ego_history_data = torch.tensor(ego_history_raw, dtype=torch.float32)
+
+    graph_data = GraphData(
+        x=torch.tensor(x_combined, dtype=torch.float32),
+        y=torch.tensor(y, dtype=torch.float32),
+        cluster=torch.tensor(cluster, dtype=torch.long),
+        edge_index=torch.tensor(edge_combined, dtype=torch.long),
+        valid_len=torch.tensor([cluster.max() if len(cluster) > 0 else 0], dtype=torch.long),
+        time_step_len=torch.tensor([x_list[0].shape[0] if len(x_list) > 0 else 1], dtype=torch.long),
+        traj_id_to_indices=traj_tensor,
+        ego_last_pos=torch.tensor(ego_last_pos, dtype=torch.float32).reshape(2),
+        gnn_x=pooled_tensor,
+        gnn_edge_index=edge_index_gnn,
+        gnn_edge_attr=edge_attr_gnn,
+        ego_history=ego_history_data
+    )
+    return graph_data, None
+
+
 class GraphDataset(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None):
         # 获取当前邻接矩阵配置
@@ -345,124 +513,14 @@ class GraphDataset(InMemoryDataset):
         for data_path in tqdm(data_path_list):
             try:
                 data = pd.read_pickle(data_path)
-                features = data['POLYLINE_FEATURES'].values[0].astype(np.float32)
-                cluster = features[:, -1].astype(np.int64)
-                y = data['GROUND_TRUTH'].values[0].astype(np.float32)
-
-                # 确保Ground Truth是2维数组 (60, 2)
-                if y.ndim == 3 and y.shape[0] == 1:
-                    y = y.squeeze(0)
-                assert y.ndim == 2 and y.shape[1] == 2, f"Ground Truth维度错误: 期望(N, 2), 实际{y.shape}"
-
-                traj_id_dict = data['TRAJ_ID_TO_INDICES'].values[0]
-                lane_id_dict = data['LANE_ID_TO_INDICES'].values[0]
-
-                if len(traj_id_dict) == 0 and len(lane_id_dict) == 0:
+                # 抽出的共享 helper：离线 process() 与在线 planner 同一图构建，保证在线==离线逐字段一致
+                graph_data, skip_reason = build_graph_data_from_feature_df(data, self.adjacency_config)
+                if skip_reason == 'empty_traj':
                     stats['skipped_empty_traj'] += 1
                     continue
-
-                x_list, edge_list, cluster_list = [], [], []
-                cluster_id = 0
-
-                # Process trajectory polylines
-                for polyline_id, (start, end) in traj_id_dict.items():
-                    if end < start:
-                        continue
-                    traj = features[start:end + 1]
-                    if traj.shape[0] < 2:
-                        continue
-
-                    x_list.append(traj)
-                    edge_index = get_sequential_edge_index(len(traj), start)
-                    if edge_index.ndim == 2 and edge_index.shape[1] > 0:
-                        edge_list.append(edge_index)
-                        cluster_list.append(cluster_id)
-                        cluster_id += 1
-
-                # Process lane polylines
-                if len(lane_id_dict) > 0:
-                    lane_offset = max(end for _, end in traj_id_dict.values()) + 1 if len(traj_id_dict) > 0 else 0
-                    for lane_id, (start, end) in lane_id_dict.items():
-                        if end < start:
-                            continue
-                        lane = features[lane_offset + start: lane_offset + end + 1]
-                        if lane.shape[0] < 2:
-                            continue
-
-                        x_list.append(lane)
-                        edge_index = get_sequential_edge_index(len(lane), lane_offset + start)
-                        if edge_index.ndim == 2 and edge_index.shape[1] > 0:
-                            edge_list.append(edge_index)
-                            cluster_list.append(cluster_id)
-                            cluster_id += 1
-
-                if len(x_list) == 0:
+                if skip_reason == 'no_polylines':
                     stats['skipped_no_polylines'] += 1
                     continue
-
-                x_combined = np.vstack(x_list)
-                edge_combined = np.hstack(edge_list) if len(edge_list) > 0 else np.zeros((2, 0), dtype=np.int64)
-                traj_tensor = torch.zeros(1, 3, dtype=torch.long)
-
-                # 处理GNN数据
-                pooled_tensor = torch.zeros(1, 12)
-                edge_index_gnn = torch.zeros(2, 0, dtype=torch.long)
-                edge_attr_gnn = torch.zeros(0, dtype=torch.long)
-
-                if 'SUBGRAPH_ID_TO_NODE_INDICES' in data.columns:
-                    try:
-                        subgraph_id_to_indices = data['SUBGRAPH_ID_TO_NODE_INDICES'].values[0]
-                        subgraph_id_to_types = data['SUBGRAPH_ID_TO_TYPE'].values[0]
-                        pooled_dict = subgraph_pooling(features, subgraph_id_to_indices)
-
-                        custom_builder = get_adjacency_config(get_current_adjacency_config())
-                        gnn_graph = build_graph_from_subgraphs(
-                            pooled_dict,
-                            subgraph_id_to_types,
-                            distance_threshold=30.0,
-                            adjacency_builder=custom_builder
-                        )
-
-                        if len(gnn_graph['nodes']) > 0:
-                            pooled_tensor = torch.tensor([pooled_dict[i] for i in gnn_graph['nodes']], dtype=torch.float)
-                            if len(gnn_graph['edges']) > 0:
-                                mapped_edges = np.array(gnn_graph['edges']).T
-                                edge_index_gnn = torch.tensor(mapped_edges, dtype=torch.long)
-                                edge_attr_gnn = torch.tensor(gnn_graph['edge_types'][:len(mapped_edges)], dtype=torch.long)
-                    except Exception as e:
-                        print(f"Warning: GNN data processing failed: {e}")
-
-                # 处理ego_last_pos
-                ego_last_pos = np.zeros(2, dtype=np.float32)
-                if 'EGO_LAST_POS' in data.columns:
-                    ego_last_pos_raw = data['EGO_LAST_POS'].values[0]
-                    if ego_last_pos_raw is not None:
-                        if isinstance(ego_last_pos_raw, (list, tuple)):
-                            ego_last_pos = np.array(ego_last_pos_raw, dtype=np.float32)[:2]
-                        elif isinstance(ego_last_pos_raw, np.ndarray):
-                            ego_last_pos = ego_last_pos_raw.astype(np.float32)[:2]
-
-                # 提取EGO_HISTORY数据
-                ego_history_data = None
-                if 'EGO_HISTORY' in data.columns:
-                    ego_history_raw = data['EGO_HISTORY'].values[0]
-                    if ego_history_raw is not None and isinstance(ego_history_raw, np.ndarray):
-                        ego_history_data = torch.tensor(ego_history_raw, dtype=torch.float32)
-
-                graph_data = GraphData(
-                    x=torch.tensor(x_combined, dtype=torch.float32),
-                    y=torch.tensor(y, dtype=torch.float32),
-                    cluster=torch.tensor(cluster, dtype=torch.long),
-                    edge_index=torch.tensor(edge_combined, dtype=torch.long),
-                    valid_len=torch.tensor([cluster.max() if len(cluster) > 0 else 0], dtype=torch.long),
-                    time_step_len=torch.tensor([x_list[0].shape[0] if len(x_list) > 0 else 1], dtype=torch.long),
-                    traj_id_to_indices=traj_tensor,
-                    ego_last_pos=torch.tensor(ego_last_pos, dtype=torch.float32).reshape(2),
-                    gnn_x=pooled_tensor,
-                    gnn_edge_index=edge_index_gnn,
-                    gnn_edge_attr=edge_attr_gnn,
-                    ego_history=ego_history_data
-                )
 
                 graph_data_list.append(graph_data)
                 stats['processed'] += 1

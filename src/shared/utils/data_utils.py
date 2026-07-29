@@ -270,7 +270,8 @@ def pad_agent_states_with_zeros(agent_trajectories):
 
 
 def convert_feature_layer_to_fixed_size(ego_pose, feature_coords, feature_tl_data, max_elements, max_points,
-                                        traffic_light_encoding_dim, interpolation):
+                                        traffic_light_encoding_dim, interpolation,
+                                        return_selected_indices=False):
     """
     Converts variable sized map features to fixed size tensors. Map elements are padded/trimmed to max_elements size.
         Points per feature are interpolated to maintain max_points size.
@@ -284,10 +285,19 @@ def convert_feature_layer_to_fixed_size(ego_pose, feature_coords, feature_tl_dat
     :param traffic_light_encoding_dim: Dimensionality of traffic light data.
     :param interpolation: Optional interpolation mode for maintaining fixed number of points per element.
         None indicates trimming and zero-padding to take place in lieu of interpolation. Interpolation options: 'linear' and 'area'.
+    :param return_selected_indices: 若为 True，额外返回本函数**实际采用的原始 element 索引列表**
+        `selected_indices`，满足 `coords_tensor[i] == f(feature_coords[selected_indices[i]])`。
+
+        ⚠️ 本函数**按到 ego 的最小距离对 element 重排后截断**（下方 `sorted(...)`），
+        与 devkit 同名函数（`nuplan/.../vector_preprocessing.py`，严格保序）行为**不同**，
+        而生效副本是本文件这一份。任何需要与最终 lane 顺序对齐的旁路特征
+        （如 route 三通道）**必须**取本返回值作为唯一真相源，**不得**在别处复制这段排序公式
+        ——2026-07-28 的 lane-route 错位事故正是源于此（详见阶段⑬）。
     :return
         coords_tensor: The converted coords tensor.
         tl_data_tensor: The converted traffic light data tensor (if available).
         avails_tensor: Availabilities tensor identifying real vs zero-padded data in coords_tensor and tl_data_tensor.
+        selected_indices (可选): List[int]，长度 = min(len(feature_coords), max_elements)。
     :raise ValueError: If coordinates and traffic light data size do not match.
     """
     if feature_tl_data is not None and len(feature_coords) != len(feature_tl_data):
@@ -311,6 +321,9 @@ def convert_feature_layer_to_fixed_size(ego_pose, feature_coords, feature_tl_dat
     mapping = sorted(mapping.items(), key=lambda item: item[1])
     sorted_elements = mapping[:max_elements]
 
+    # 本函数采用的原始 element 顺序（唯一真相源；供 route 等旁路特征对齐，见 docstring）
+    selected_indices = [int(element_idx[0]) for element_idx in sorted_elements]
+
     # pad or trim waypoints in a map element
     for idx, element_idx in enumerate(sorted_elements):
         element_coords = feature_coords[element_idx[0]]
@@ -323,6 +336,8 @@ def convert_feature_layer_to_fixed_size(ego_pose, feature_coords, feature_tl_dat
         if tl_data_tensor is not None and feature_tl_data is not None:
             tl_data_tensor[idx] = feature_tl_data[element_idx[0]]
 
+    if return_selected_indices:
+        return coords_tensor, tl_data_tensor, avails_tensor, selected_indices
     return coords_tensor, tl_data_tensor, avails_tensor
 
 
@@ -333,6 +348,7 @@ def get_neighbor_vector_set_map(
         radius: float,
         route_roadblock_ids: List[str],
         traffic_light_status_data: List[TrafficLightStatusData],
+        return_lane_ids: bool = False,
 ) -> Tuple[Dict[str, MapObjectPolylines], Dict[str, LaneSegmentTrafficLightData]]:
     """
     Extract neighbor vector set map information around ego vehicle.
@@ -351,6 +367,7 @@ def get_neighbor_vector_set_map(
     coords: Dict[str, MapObjectPolylines] = {}
     traffic_light_data: Dict[str, LaneSegmentTrafficLightData] = {}
     feature_layers: List[VectorFeatureLayer] = []
+    _extracted_lane_ids: List[str] = []  # 与 coords['LANE'] 同序，供 return_lane_ids 使用
 
     for feature_name in map_features:
         try:
@@ -364,6 +381,9 @@ def get_neighbor_vector_set_map(
 
         # lane baseline paths
         coords[VectorFeatureLayer.LANE.name] = lanes_mid
+
+        # 与 lanes_mid 严格同序的 lane id（供 build_route_channels 做精确 on-route 匹配）
+        _extracted_lane_ids = list(lane_ids.lane_ids)
 
         # lane traffic light data
         traffic_light_data[VectorFeatureLayer.LANE.name] = get_traffic_light_encoding(
@@ -389,10 +409,202 @@ def get_neighbor_vector_set_map(
             )
             coords[feature_layer.name] = polygons
 
+    if return_lane_ids:
+        return coords, traffic_light_data, _extracted_lane_ids
     return coords, traffic_light_data
 
 
-def map_process(anchor_state, coords, traffic_light_data, map_features, max_elements, max_points, interpolation_method):
+def get_route_lane_progress(map_api, point, radius, route_roadblock_ids) -> dict:
+    """返回 {route 上的 lane id -> 沿 route 的归一化进度 ∈ [0,1]}。
+
+    `route_roadblock_ids` 本身是**沿行进方向有序**的（devkit 约定），`prune_route_by_connectivity`
+    保序裁剪，故裁剪后第 k 个 roadblock 的进度即 k/(K-1)：0=route 在半径内的起点（≈ego 当前处），
+    1=半径内 route 的末端。同一 roadblock 的多条平行 lane 共享同一进度值。
+
+    返回 dict 而非 set，是为了同时支撑 col7（进度通道）与 col8（is_on_route）；
+    因 `lid in dict` 与 `lid in set` 语义一致，调用方做成员判断时可直接替换。
+
+    :return: {lane_id: progress}；route 为空时返回 {}。
+    """
+    from nuplan.common.maps.maps_datatypes import SemanticMapLayer
+    from nuplan.planning.training.preprocessing.feature_builders.vector_builder_utils import (
+        prune_route_by_connectivity,
+    )
+
+    if not route_roadblock_ids:
+        return {}
+
+    layer_names = [SemanticMapLayer.ROADBLOCK, SemanticMapLayer.ROADBLOCK_CONNECTOR]
+    layers = map_api.get_proximal_map_objects(point, radius, layer_names)
+
+    roadblock_ids: set = set()
+    for layer_name in layer_names:
+        roadblock_ids = roadblock_ids.union({map_object.id for map_object in layers[layer_name]})
+
+    pruned_ids = prune_route_by_connectivity(route_roadblock_ids, roadblock_ids)
+    if not pruned_ids:
+        return {}
+
+    denom = max(len(pruned_ids) - 1, 1)
+    progress: dict = {}
+    for k, route_roadblock_id in enumerate(pruned_ids):
+        roadblock_obj = map_api.get_map_object(route_roadblock_id, SemanticMapLayer.ROADBLOCK)
+        if not roadblock_obj:
+            roadblock_obj = map_api.get_map_object(route_roadblock_id, SemanticMapLayer.ROADBLOCK_CONNECTOR)
+        if roadblock_obj:
+            p = float(k) / denom
+            for edge in roadblock_obj.interior_edges:
+                # 同一 lane 若被多个 roadblock 引用，保留更靠前（更接近 ego）的进度
+                if edge.id not in progress:
+                    progress[edge.id] = p
+
+    return progress
+
+
+def reorder_lane_ids(lane_ids, selected_indices):
+    """按 map_process 实际采用的 selected_indices 重排 lane_ids，使其与 `vector_map['lanes']` 同序。
+
+    这是 lane 排序的**唯一对齐入口**：调用方不得自行复制
+    `convert_feature_layer_to_fixed_size` 里的距离排序公式（2026-07-28 lane-route 错位事故根因）。
+
+    :param lane_ids: `get_neighbor_vector_set_map(..., return_lane_ids=True)` 返回的原始序 id 列表。
+    :param selected_indices: `map_process(..., return_selected_indices=True)` 返回的 `[...]['LANE']`。
+    :return: List[str]，第 i 项即最终第 i 条 lane 的 id。
+    """
+    return [lane_ids[i] for i in selected_indices if 0 <= i < len(lane_ids)]
+
+
+def build_route_channels(ordered_lane_ids, ordered_lane_polylines, route_lane_progress,
+                         max_lanes, map_radius) -> np.ndarray:
+    """构造与 `vector_map['lanes']` **同序**的 route 三通道特征 (max_lanes, 3)。
+
+    列语义（对应写入 lane 节点的 col6 / col7 / col8）：
+      [:, 0] route 邻近度 = clip(1 - d/map_radius, 0, 1)，d = 该 lane 中心到最近 on-route lane
+             中心的距离。on-route lane 恒为 1.0；离 route 越远越接近 0 —— 让 off-route lane 也带
+             连续梯度，而非只有 0/1 硬标记。
+      [:, 1] 沿 route 归一化进度 ∈ [0,1]；off-route lane = 0。
+      [:, 2] is_on_route ∈ {0,1}。
+
+    route 为空（实测约 11.8% 样本，全部源自 devkit `prune_route_by_connectivity` 的半径连通性
+    裁剪）时三通道全 0，与「无 route 信息」的语义统一。
+
+    ⚠️ **顺序契约（2026-07-28 事故后强化）**：本函数**不做任何排序**，要求调用方传入的
+    `ordered_lane_ids` / `ordered_lane_polylines` 已经是 `map_process` 输出的最终顺序
+    （用 `reorder_lane_ids(lane_ids, selected_indices['LANE'])` 得到）。
+    生效的 `convert_feature_layer_to_fixed_size` 会按到 ego 的距离重排并截断，
+    若在此处沿用原始 `lane_ids` 顺序，route 标签会被写到错误的 lane 上。
+
+    :param ordered_lane_ids: 最终顺序的 lane id 列表（长度 ≤ max_lanes）。
+    :param ordered_lane_polylines: 最终顺序的 lane 折线，形如 `vector_map['lanes']`
+        （(N, P, >=2)，局部坐标）或等价 list；只用前两维算中心点。距离是刚体变换不变量，
+        故用局部坐标与用全局坐标等价。
+    :param route_lane_progress: `get_route_lane_progress` 的产出 {lane_id: 进度}。
+    :param max_lanes: 对齐 config.LANE_NUM 的输出行数。
+    :param map_radius: 归一化邻近度用的尺度（config.MAP_RADIUS）。
+    """
+    out = np.zeros((max_lanes, 3), dtype=np.float32)
+    if not route_lane_progress or len(ordered_lane_ids) == 0:
+        return out
+
+    n = min(len(ordered_lane_ids), max_lanes, len(ordered_lane_polylines))
+    if n <= 0:
+        return out
+
+    centers = np.full((n, 2), np.nan, dtype=np.float64)
+    for i in range(n):
+        poly = np.asarray(ordered_lane_polylines[i], dtype=np.float64)
+        if poly.ndim == 2 and poly.shape[0] > 0 and poly.shape[1] >= 2:
+            pts = poly[:, :2]
+            # padding 出来的全零 lane 不参与中心点计算（其 avail=False）
+            nz = pts[np.any(pts != 0.0, axis=1)]
+            if nz.shape[0] > 0:
+                centers[i] = nz.mean(axis=0)
+
+    on_route_mask = np.array(
+        [ordered_lane_ids[i] in route_lane_progress for i in range(n)], dtype=bool
+    )
+    if not on_route_mask.any():
+        # route 存在但其 lane 全部落在最终选中的 max_lanes 之外（实测 3000 样本中仅 1 例）
+        return out
+
+    out[:n, 2] = on_route_mask.astype(np.float32)
+    out[:n, 1] = np.array(
+        [route_lane_progress.get(ordered_lane_ids[i], 0.0) for i in range(n)], dtype=np.float32
+    )
+
+    ref = centers[on_route_mask]                                          # (m,2)
+    d = np.linalg.norm(centers[:, None, :] - ref[None, :, :], axis=-1)    # (n,m)
+    with np.errstate(invalid="ignore"):
+        d_min = np.nanmin(d, axis=1)
+    d_min = np.where(np.isfinite(d_min), d_min, map_radius)
+    out[:n, 0] = np.clip(1.0 - d_min / float(map_radius), 0.0, 1.0).astype(np.float32)
+    # on-route lane 到自身距离为 0 -> 邻近度恒 1（中心点缺失时兜底显式置 1，保语义一致）
+    out[:n, 0] = np.where(on_route_mask, 1.0, out[:n, 0]).astype(np.float32)
+
+    return out
+
+
+def get_route_lane_ids(map_api, point, radius, route_roadblock_ids) -> set:
+    """返回查询半径内、位于 ego 导航 route 上的 lane / lane_connector id 集合。
+
+    复刻 devkit `get_route_lane_polylines_from_roadblock_ids`（vector_builder_utils.py:386）的
+    对象枚举逻辑，但只取 `map_obj.id` 而不构造 polyline —— 我们只需要 id 集合来给 LANE 打
+    on-route 标记（方案B），route 几何本身不入图，故跳过 polyline 构造省一份开销。
+
+    两侧的对象来源一致（roadblock/roadblock_connector 的 interior_edges 即 lane/lane_connector，
+    与 `get_lane_polylines` 枚举的 LANE/LANE_CONNECTOR 图层同一批对象、同一 id 空间），
+    因此可做**精确 id 匹配**，无需几何近似。
+
+    :param map_api: nuPlan AbstractMap。
+    :param point: [m] ego 全局 (x, y)。
+    :param radius: [m] 查询半径（与 get_lane_polylines 同值）。
+    :param route_roadblock_ids: scenario 给出的 route roadblock id 列表；空列表 → 返回空集合。
+    :return: route 上的 lane id 集合（str）。
+
+    保留为 `get_route_lane_progress` 的薄封装：只需成员判断（如覆盖率统计）时用本函数，
+    需要进度通道时直接用 `get_route_lane_progress`。
+    """
+    return set(get_route_lane_progress(map_api, point, radius, route_roadblock_ids).keys())
+
+
+def build_lane_on_route_flags(lane_ids, route_lane_ids, max_lanes=None) -> np.ndarray:
+    """把 lane id 序列 + route lane id 集合 → **与入参 `lane_ids` 同序**的 0/1 数组。
+
+    ⚠️ **本函数的输出与 `vector_map['lanes']` 不对齐**，只与传进来的 `lane_ids` 同序。
+
+    早先的 docstring 曾断言「`map_process` → `convert_feature_layer_to_fixed_size` 严格保序截断，
+    故 `flags[i]` 与 `vector_map['lanes'][i]` 精确对齐」—— **该断言已被证伪**：那描述的是 devkit
+    的同名函数（`nuplan/.../vector_preprocessing.py`），而生效副本是本文件的
+    :func:`convert_feature_layer_to_fixed_size`（本文件 :272），它**按到 ego 的最小距离重排后再截断**。
+    2026-07-28 的 lane-route 错位事故（阶段⑬）正是源于信了这条已失效的顺序保证。
+
+    需要与最终 lane 顺序对齐时，唯一正确的做法是先过 :func:`reorder_lane_ids`：
+
+        vector_map, sel = map_process(..., return_selected_indices=True)
+        ordered = reorder_lane_ids(lane_ids, sel['LANE'])
+        flags = build_lane_on_route_flags(ordered, route_lane_ids, max_lanes)
+
+    本函数**仍可直接用于集合级统计**（如 `stat_route_coverage.py` 数 on-route lane 条数 /
+    判空 route）—— 计数不依赖顺序，那里不需要重排。
+
+    :param lane_ids: 与所需输出顺序一致的 lane id 列表。要对齐 `vector_map['lanes']`
+        必须先经 `reorder_lane_ids`；直接传 `get_neighbor_vector_set_map(return_lane_ids=True)`
+        的原始序只适用于顺序无关的统计。
+    :param route_lane_ids: get_route_lane_ids 返回的集合。
+    :param max_lanes: 可选，截断/补零到该长度（对齐 config.LANE_NUM，含 padding lane 记 0）。
+    :return: float32 数组，1.0=该 lane 在 route 上。
+    """
+    flags = np.array([1.0 if lid in route_lane_ids else 0.0 for lid in lane_ids], dtype=np.float32)
+    if max_lanes is not None:
+        out = np.zeros(max_lanes, dtype=np.float32)
+        n = min(len(flags), max_lanes)
+        out[:n] = flags[:n]
+        return out
+    return flags
+
+
+def map_process(anchor_state, coords, traffic_light_data, map_features, max_elements, max_points,
+                interpolation_method, return_selected_indices=False):
     """
     This function process the data from the raw vector set map data.
     :param anchor_state: The current state of the ego vehicle.
@@ -433,6 +645,7 @@ def map_process(anchor_state, coords, traffic_light_data, map_features, max_elem
     """
 
     tensor_output = {}
+    selected_indices_out = {}   # {feature_name: List[int]}，唯一真相源，供 route 等旁路特征对齐
     traffic_light_encoding_dim = LaneSegmentTrafficLightData.encoding_dim()
 
     for feature_name in map_features:
@@ -445,7 +658,7 @@ def map_process(anchor_state, coords, traffic_light_data, map_features, max_elem
                 else None
             )
 
-            coords, tl_data, avails = convert_feature_layer_to_fixed_size(
+            coords, tl_data, avails, _sel_idx = convert_feature_layer_to_fixed_size(
                 anchor_state_tensor,
                 feature_coords,
                 feature_tl_data,
@@ -462,7 +675,10 @@ def map_process(anchor_state, coords, traffic_light_data, map_features, max_elem
                        VectorFeatureLayer.CROSSWALK.name
                    ]
                 else None,
+                return_selected_indices=True,
             )
+
+            selected_indices_out[feature_name] = _sel_idx
 
             coords = vector_set_coordinates_to_local_frame(coords, avails, anchor_state_tensor)
 
@@ -478,6 +694,11 @@ def map_process(anchor_state, coords, traffic_light_data, map_features, max_elem
     P: number of points (fixed for a given map feature)
     F: number of features
     """
+
+    # LANE-only（决策A）：预先初始化三类容器，避免只有 LANE 时末尾组装 vector_map_output 触发 NameError
+    vector_map_lanes = []
+    vector_map_crosswalks = []
+    vector_map_route_lanes = []
 
     for feature_name in map_features:
         if feature_name == "LANE":
@@ -502,6 +723,8 @@ def map_process(anchor_state, coords, traffic_light_data, map_features, max_elem
     vector_map_output = {'lanes': vector_map_lanes, 'crosswalks': vector_map_crosswalks,
                          'route_lanes': vector_map_route_lanes}
 
+    if return_selected_indices:
+        return vector_map_output, selected_indices_out
     return vector_map_output
 
 
@@ -560,8 +783,14 @@ def encoding_vectornet_features(
     vector_map,
     time_stamps_past,  # ✅ 绝对时间戳数组（torch tensor，单位秒）
     T_ref,             # ✅ 参考绝对时间（float，单位秒）
-    ego_history=None   # ✅ 新增参数：ego历史轨迹数据
+    ego_history=None,        # ✅ 新增参数：ego历史轨迹数据
+    lane_route_channels=None # ★ VT-2026-04191 阶段⑫：与 vector_map['lanes'] 同序的 route 三通道
 ):
+    """:param lane_route_channels: 可选，形状 (≥len(vector_map['lanes']), 3) 的数组，由
+    `build_route_channels` 生成，顺序与 map_process 的 coords['LANE'] 严格一致。
+    三列依次写入 lane 节点的 col6/col7/col8（这三列对 lane 原为 0 占位）：
+    route 邻近度 / 沿 route 归一化进度 / is_on_route。
+    传 None 时三列保持全 0，与 route 引入前的产出逐字节一致。"""
     import numpy as np
 
     # ✅ 关键修复：在坐标转换之前保存ego车辆的绝对位置
@@ -659,16 +888,27 @@ def encoding_vectornet_features(
 
     # —— 后面对 map_subgraph 的处理保持原样，只需在最后两列填 0 占位 ——
 
-    for lane in vector_map['lanes']:
+    for lane_idx, lane in enumerate(vector_map['lanes']):
         L = len(lane)
+        # 方案B（VT-2026-04191 阶段⑫）：父类 transformer_predictor.py 锁死 Linear(9,128)/
+        # LayerNorm(9) 且 col9 已是 subgraph_ID，节点特征无法扩到 10 维，故把 route 信号写进
+        # lane 节点仅有的三个空闲通道 —— col6/col7/col8 对 lane 原本恒为 0 占位，携带零信息：
+        #   col6 = route 邻近度 clip(1-d/radius,0,1)   col7 = 沿 route 归一化进度
+        #   col8 = is_on_route ∈ {0,1}
+        # lane_route_channels=None 时三列全为 0.0，与 route 引入前逐字节一致
+        #（danger 线 process_pittsburgh.py 等旧调用方零影响）。
+        ch = (0.0, 0.0, 0.0)
+        if lane_route_channels is not None and lane_idx < len(lane_route_channels):
+            row = lane_route_channels[lane_idx]
+            ch = (float(row[0]), float(row[1]), float(row[2]))
         lane_subgraph = np.hstack((
             lane[:-1, :2],
             lane[1:,  :2],
             lane[:-1, 2].reshape(-1,1),
             lane[1:,  2].reshape(-1,1),
-            np.zeros((L-1,1)),                # timestamp 占位
-            np.zeros((L-1,1)),                # v_start 占位
-            np.zeros((L-1,1)),                # v_end   占位
+            np.full((L-1,1), ch[0]),          # ★ col6：timestamp 占位列 → route 邻近度
+            np.full((L-1,1), ch[1]),          # ★ col7：v_start 占位列   → route 进度
+            np.full((L-1,1), ch[2]),          # ★ col8：v_end 占位列     → is_on_route
             np.ones((L-1,1)) * subgraph_ID,   # subgraph ID
             np.zeros((L-1,1)),                # start_time 占位
             np.zeros((L-1,1))                 # end_time   占位
@@ -680,36 +920,8 @@ def encoding_vectornet_features(
         subgraph_ID_to_type[subgraph_ID] = 'lane'  # ✅ 标记为地图子图
         subgraph_ID += 1
 
-    # 编码车道中心线特征
-    for lane in vector_map['lanes']:
-        N = len(lane)  # e.g. lane.shape -> (N, 3)
-
-        lane_subgraph = np.hstack((
-            lane[:-1, :2],
-            lane[1:, :2],
-            lane[:-1, 2].reshape(-1, 1),
-            lane[1:, 2].reshape(-1, 1),
-            np.zeros((N - 1, 1)),  # timestamp
-            np.zeros((N - 1, 1)),  # v_start
-            np.zeros((N - 1, 1)),  # v_end
-            np.ones((N - 1, 1)) * subgraph_ID,
-            np.zeros((N - 1, 1)),  # start_time 占位
-            np.zeros((N - 1, 1))   # end_time 占位
-        ))
-
-        # 将车道子图合并到地图子图中
-        map_subgraph = np.vstack((map_subgraph, lane_subgraph))
-
-        start_ID = end_ID + 1
-        end_ID += len(lane_subgraph)
-        map_ID_to_indices[subgraph_ID] = (start_ID, end_ID)
-        subgraph_ID += 1
-
-    for lane in vector_map['crosswalks']:
-        pass
-
-    for lane in vector_map['route_lanes']:
-        pass
+    # 决策A LANE-only：已删除重复的第二段 lane 编码（原双重编码致 subgraph_ID 翻倍、且无 type 标注）
+    # 及 crosswalk/route 的空 pass 循环；lane 只由上方第一段循环编码一次
 
     # print("[DEBUG] trajectory_subgraph shape:", trajectory_subgraph.shape)
     # print("[DEBUG] map_subgraph shape:", map_subgraph.shape)

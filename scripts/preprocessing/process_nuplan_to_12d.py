@@ -11,7 +11,7 @@ import torch
 import numpy as np
 import pandas as pd
 from pathlib import Path
-import config
+import config as dm_config  # 模块 config；避免与函数内局部 dict `config` 同名遮蔽
 
 # 添加路径
 sys.path.append('/mnt/local/Xiao_Yi/nuplan-devkit')
@@ -25,7 +25,10 @@ from GNN_Trans.utils.data_utils import (
     agent_future_process,
     get_neighbor_vector_set_map,
     map_process,
-    encoding_vectornet_features
+    encoding_vectornet_features,
+    get_route_lane_progress,
+    build_route_channels,
+    reorder_lane_ids
 )
 
 from nuplan.planning.training.preprocessing.feature_builders.vector_builder_utils import VectorFeatureLayer
@@ -47,15 +50,16 @@ def process_nuplan_scenario_to_12d_features(scenario, config):
     print(f"处理场景: {scenario.scenario_name}")
 
     # 1. 提取ego历史轨迹
+    # D0#3 修复 M2（2026-07-29）：与 `_silent` 版本及 planner 的 history buffer 同构 ——
+    # 19 帧真实过去 + 当前帧，锚点落在 t0。
     print("1. 提取ego历史轨迹...")
-    ego_states = scenario.get_ego_past_trajectory(
+    n_past = config['num_past_poses']
+    past_dt = float(config['past_time_horizon']) / n_past
+    ego_states = list(scenario.get_ego_past_trajectory(
         iteration=0,
-        num_samples=config['num_past_poses'],
-        time_horizon=config['past_time_horizon']
-    )
-
-    # 将生成器转换为列表
-    ego_states = list(ego_states)
+        num_samples=n_past - 1,
+        time_horizon=(n_past - 1) * past_dt
+    )) + [scenario.initial_ego_state]
 
     past_ego_states = sampled_past_ego_states_to_tensor(ego_states)
     past_timestamps = sampled_past_timestamps_to_tensor(ego_states)
@@ -70,17 +74,16 @@ def process_nuplan_scenario_to_12d_features(scenario, config):
         time_horizon=config['future_time_horizon']
     )
 
-    # 获取当前ego位置作为参考点 - 使用未来轨迹的第一个点作为起始点
     ego_future_states_list = list(ego_future_states)
 
     if not ego_future_states_list:
         raise ValueError("未来轨迹为空")
 
-    # 使用未来轨迹第一个点作为起始参考点
-    first_future_state = ego_future_states_list[0]
-    current_x = first_future_state.rear_axle.x
-    current_y = first_future_state.rear_axle.y
-    current_heading = first_future_state.rear_axle.heading
+    # D0#3 修复 M3（2026-07-29）：局部系参考位姿改用当前 ego（t0），与 planner 同系。
+    ref_state = scenario.initial_ego_state
+    current_x = ref_state.rear_axle.x
+    current_y = ref_state.rear_axle.y
+    current_heading = ref_state.rear_axle.heading
 
     # 保存ego的绝对位置，在坐标转换之前
     ego_last_absolute_position = np.array([current_x, current_y], dtype=np.float32)
@@ -114,16 +117,31 @@ def process_nuplan_scenario_to_12d_features(scenario, config):
 
     ego_future = np.array(ego_future_increments, dtype=np.float32)
 
+    # 决策D：EGO_HISTORY 改存 [20,2] 车辆局部坐标系逐帧增量
+    # 与 ego_future 同约定、同参考朝向 current_heading（未来第0点=t=0 当前 ego）
+    ego_history_increments = [[0.0, 0.0]]
+    for i in range(1, len(ego_states)):
+        g_dx = ego_states[i].rear_axle.x - ego_states[i-1].rear_axle.x
+        g_dy = ego_states[i].rear_axle.y - ego_states[i-1].rear_axle.y
+        ego_history_increments.append([
+            g_dx * cos_h + g_dy * sin_h,     # local_dx（前向）
+            -g_dx * sin_h + g_dy * cos_h,    # local_dy（左向）
+        ])
+    ego_history_local = torch.from_numpy(np.array(ego_history_increments, dtype=np.float32))  # [20,2]
+
     print(f"   ✅ Ego未来轨迹（车辆局部坐标系）: {ego_future.shape}")
     print(f"   📊 局部坐标范围: x[{ego_future[:, 0].min():.2f}, {ego_future[:, 0].max():.2f}], y[{ego_future[:, 1].min():.2f}, {ego_future[:, 1].max():.2f}]")
     print(f"   🧭 车辆朝向: {current_heading:.4f} rad ({np.degrees(current_heading):.1f}°)")
 
     # 3. 提取其他车辆轨迹
+    # D0#3 修复 M1（2026-07-29，information leakage）：原 `get_tracked_objects_at_iteration(0..19)`
+    # 取的是 t0…t0+0.95 s 的**未来**（database_interval=0.05）。改为真实过去 19 帧 + 当前帧。
     print("3. 提取其他车辆轨迹...")
-    past_tracked_objects = []
-    for i in range(config['num_past_poses']):
-        tracked_objects = scenario.get_tracked_objects_at_iteration(i)
-        past_tracked_objects.append(tracked_objects)
+    past_tracked_objects = list(scenario.get_past_tracked_objects(
+        iteration=0,
+        time_horizon=(n_past - 1) * past_dt,
+        num_samples=n_past - 1
+    )) + [scenario.initial_tracked_objects]
 
     tracked_objects_tensor_list, tracked_objects_types = sampled_tracked_objects_to_tensor_list(
         past_tracked_objects
@@ -167,26 +185,41 @@ def process_nuplan_scenario_to_12d_features(scenario, config):
     current_ego_state = ego_states[-1]
     ego_position = Point2D(current_ego_state.rear_axle.x, current_ego_state.rear_axle.y)
 
-    # 获取地图特征
-    coords, traffic_light_data = get_neighbor_vector_set_map(
+    # 获取地图特征（D1-2 route 契约：传真实 route_roadblock_ids + 取同序 lane_ids）
+    route_roadblock_ids = scenario.get_route_roadblock_ids() or []
+    coords, traffic_light_data, lane_ids = get_neighbor_vector_set_map(
         scenario.map_api,
         config['map_features'],
         ego_position,
         config['map_radius'],
-        [],  # route_roadblock_ids，可以根据需要添加
-        []   # traffic_light_status_data，可以根据需要添加
+        route_roadblock_ids,
+        [],  # traffic_light_status_data，可以根据需要添加
+        return_lane_ids=True
+    )
+    route_lane_progress = get_route_lane_progress(
+        scenario.map_api, ego_position, config['map_radius'], route_roadblock_ids
     )
 
-    # 处理地图数据
-    vector_map = map_process(
+    # 处理地图数据（取回 selected_indices：lane 排序的唯一真相源）
+    vector_map, selected_indices = map_process(
         current_ego_state.rear_axle,
         coords,
         traffic_light_data,
         config['map_features'],
         config['max_elements'],
         config['max_points'],
-        config['interpolation_method']
+        config['interpolation_method'],
+        return_selected_indices=True
     )
+    # route 三通道必须在 map_process 之后、按其最终 lane 顺序构造
+    if config.get('route_mode', 'none') == 'three_channel':
+        ordered_lane_ids = reorder_lane_ids(lane_ids, selected_indices.get('LANE', []))
+        lane_route_channels = build_route_channels(
+            ordered_lane_ids, vector_map['lanes'],
+            route_lane_progress, config['max_elements']['LANE'], config['map_radius']
+        )
+    else:
+        lane_route_channels = None   # route_mode='none' -> col6/7/8 保持全 0
 
     print(f"   ✅ 地图信息: {len(vector_map['lanes'])}条车道")
 
@@ -205,7 +238,8 @@ def process_nuplan_scenario_to_12d_features(scenario, config):
         vector_map,
         past_timestamps,
         T_ref,
-        ego_history=past_ego_states  # 传递ego历史轨迹数据
+        ego_history=ego_history_local,  # [20,2] 局部增量（决策D）
+        lane_route_channels=lane_route_channels  # route 三通道 -> lane col6/col7/col8
     )
 
     # ✅ 关键修复：手动设置正确的ego绝对位置
@@ -234,12 +268,16 @@ def process_nuplan_scenario_to_12d_features_silent(scenario, config):
 
     try:
         # 1. 提取ego历史轨迹
-        ego_states = scenario.get_ego_past_trajectory(
+        # D0#3 修复 M2（2026-07-29）：与 planner 的 SimulationHistoryBuffer 同构 ——
+        # 19 帧真实过去 + 当前帧，锚点 ego_states[-1] = t0（原实现为 20 帧纯过去，锚点落在
+        # t0-0.1，导致地图查询点与在线相差约 1 m）。t_ref 亦随之对齐到 t0。
+        n_past = config['num_past_poses']
+        past_dt = float(config['past_time_horizon']) / n_past
+        ego_states = list(scenario.get_ego_past_trajectory(
             iteration=0,
-            num_samples=config['num_past_poses'],
-            time_horizon=config['past_time_horizon']
-        )
-        ego_states = list(ego_states)
+            num_samples=n_past - 1,
+            time_horizon=(n_past - 1) * past_dt
+        )) + [scenario.initial_ego_state]
         past_ego_states = sampled_past_ego_states_to_tensor(ego_states)
         past_timestamps = sampled_past_timestamps_to_tensor(ego_states)
 
@@ -250,17 +288,21 @@ def process_nuplan_scenario_to_12d_features_silent(scenario, config):
             time_horizon=config['future_time_horizon']
         )
 
-        # 获取当前ego位置作为参考点 - 使用未来轨迹的第一个点作为起始点
         ego_future_states_list = list(ego_future_states)
 
         if not ego_future_states_list:
             raise ValueError("未来轨迹为空")
 
-        # 使用未来轨迹第一个点作为起始参考点
-        first_future_state = ego_future_states_list[0]
-        current_x = first_future_state.rear_axle.x
-        current_y = first_future_state.rear_axle.y
-        current_heading = first_future_state.rear_axle.heading
+        # D0#3 修复 M3（2026-07-29）：局部系参考位姿改用**当前 ego**（t0），与 planner 的
+        # `_output_to_trajectory(output, history.ego_states[-1])` 完全同系。
+        # 原实现用 future[0]（t0+0.1）作参考朝向，与在线相差 1 帧。
+        # 注意：increments 的时间口径不变（仍 increments[0]=[0,0]、cumsum[i] 覆盖 i·dt 的位移），
+        # 与 planner 把 cumsum[i] 放在 t0+i·dt 的做法在**时长上自洽**；残留的 0.1 s 相位差
+        # 见阶段⑰ M4，属两侧协同改动，本次不动。
+        ref_state = scenario.initial_ego_state
+        current_x = ref_state.rear_axle.x
+        current_y = ref_state.rear_axle.y
+        current_heading = ref_state.rear_axle.heading
 
         # 保存ego的绝对位置，在坐标转换之前
         ego_last_absolute_position = np.array([current_x, current_y], dtype=np.float32)
@@ -293,11 +335,30 @@ def process_nuplan_scenario_to_12d_features_silent(scenario, config):
 
         ego_future = np.array(ego_future_increments, dtype=np.float32)
 
+        # 决策D：EGO_HISTORY 改存 [20,2] 车辆局部坐标系逐帧增量
+        # 与 ego_future 同约定、同参考朝向 current_heading（未来第0点=t=0 当前 ego）
+        ego_history_increments = [[0.0, 0.0]]
+        for i in range(1, len(ego_states)):
+            g_dx = ego_states[i].rear_axle.x - ego_states[i-1].rear_axle.x
+            g_dy = ego_states[i].rear_axle.y - ego_states[i-1].rear_axle.y
+            ego_history_increments.append([
+                g_dx * cos_h + g_dy * sin_h,     # local_dx（前向）
+                -g_dx * sin_h + g_dy * cos_h,    # local_dy（左向）
+            ])
+        ego_history_local = torch.from_numpy(np.array(ego_history_increments, dtype=np.float32))  # [20,2]
+
         # 3. 提取其他车辆轨迹
-        past_tracked_objects = []
-        for i in range(config['num_past_poses']):
-            tracked_objects = scenario.get_tracked_objects_at_iteration(i)
-            past_tracked_objects.append(tracked_objects)
+        # D0#3 修复 M1（2026-07-29，information leakage）：原实现用
+        # `get_tracked_objects_at_iteration(i), i=0..19`，而 nuPlan 的 database_interval=0.05，
+        # 实测 iteration 19 = t0+0.95 s —— 那是 agent 的**未来**、且采样率 20 Hz。
+        # planner 在线只能给 t-1.9…t 的真实过去（10 Hz），两者窗口方向相反、时长差 2×，
+        # 实测 11/12 样本连选中的 20 个 agent 都不是同一批。改为与 planner 同构的
+        # 19 帧真实过去 + 当前帧。
+        past_tracked_objects = list(scenario.get_past_tracked_objects(
+            iteration=0,
+            time_horizon=(n_past - 1) * past_dt,
+            num_samples=n_past - 1
+        )) + [scenario.initial_tracked_objects]
 
         tracked_objects_tensor_list, tracked_objects_types = sampled_tracked_objects_to_tensor_list(
             past_tracked_objects
@@ -336,24 +397,39 @@ def process_nuplan_scenario_to_12d_features_silent(scenario, config):
         current_ego_state = ego_states[-1]
         ego_position = Point2D(current_ego_state.rear_axle.x, current_ego_state.rear_axle.y)
 
-        coords, traffic_light_data = get_neighbor_vector_set_map(
+        # D1-2 route 契约：取真实 route_roadblock_ids + 与 coords['LANE'] 同序的 lane_ids
+        route_roadblock_ids = scenario.get_route_roadblock_ids() or []
+        coords, traffic_light_data, lane_ids = get_neighbor_vector_set_map(
             scenario.map_api,
             config['map_features'],
             ego_position,
             config['map_radius'],
+            route_roadblock_ids,
             [],
-            []
+            return_lane_ids=True
+        )
+        route_lane_progress = get_route_lane_progress(
+            scenario.map_api, ego_position, config['map_radius'], route_roadblock_ids
         )
 
-        vector_map = map_process(
+        vector_map, selected_indices = map_process(
             current_ego_state.rear_axle,
             coords,
             traffic_light_data,
             config['map_features'],
             config['max_elements'],
             config['max_points'],
-            config['interpolation_method']
+            config['interpolation_method'],
+            return_selected_indices=True
         )
+        if config.get('route_mode', 'none') == 'three_channel':
+            ordered_lane_ids = reorder_lane_ids(lane_ids, selected_indices.get('LANE', []))
+            lane_route_channels = build_route_channels(
+                ordered_lane_ids, vector_map['lanes'],
+                route_lane_progress, config['max_elements']['LANE'], config['map_radius']
+            )
+        else:
+            lane_route_channels = None   # route_mode='none' -> col6/7/8 保持全 0
 
         # 6. 生成12维特征向量
         T_ref = past_timestamps[-1].item()
@@ -365,7 +441,8 @@ def process_nuplan_scenario_to_12d_features_silent(scenario, config):
             vector_map,
             past_timestamps,
             T_ref,
-            ego_history=past_ego_states  # 传递ego历史轨迹数据
+            ego_history=ego_history_local,  # [20,2] 局部增量（决策D）
+            lane_route_channels=lane_route_channels  # route 三通道 -> lane col6/col7/col8
         )
 
         # ✅ 关键修复：手动设置正确的ego绝对位置
@@ -399,6 +476,9 @@ def batch_process_nuplan_data(scenario_list, config, output_dir):
     processed_count = 0
     failed_count = 0
 
+    # E1(log-disjoint): 旁路 manifest，记录成功写盘样本的 token→log_name（不改 pkl schema）
+    log_manifest = []
+
     # 添加进度条和时间估算
     import time
     start_time = time.time()
@@ -431,6 +511,9 @@ def batch_process_nuplan_data(scenario_list, config, output_dir):
             output_file = output_dir / f"features_{scenario_name}.pkl"
             feature_df.to_pickle(output_file)
 
+            # E1(log-disjoint): 写盘成功后才记录，保证 manifest 行与 pkl 文件一一对应
+            log_manifest.append({"token": scenario_name, "log_name": scenario.log_name})
+
             print(f"✅ 场景 {scenario_name} 处理完成")
             processed_count += 1
 
@@ -447,33 +530,36 @@ def batch_process_nuplan_data(scenario_list, config, output_dir):
     print(f"   ⏰ 总用时: {total_time/60:.1f}分钟")
     print(f"   📁 结果保存在: {output_dir}")
 
+    # E1(log-disjoint): 批末写 token→log_name 旁路 manifest，供 split_log_disjoint.py 按 log 分组
+    import json
+    manifest_path = output_dir / "log_manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(log_manifest, f, ensure_ascii=False, indent=2)
+    print(f"   🗂  log manifest 写出: {manifest_path}（{len(log_manifest)} 条）")
+
 
 def create_default_config():
-    """创建默认配置参数"""
+    """创建默认配置参数（唯一源=config.py，决策C；地图 LANE-only，决策A）"""
     return {
-        # 时间相关参数
-        'num_past_poses': 20,      # 2秒历史，10Hz
-        'num_future_poses': 60,    # 6秒未来，10Hz
-        'past_time_horizon': 2.0,  # 秒
-        'future_time_horizon': 6.0, # 秒
+        # 时间相关参数（读 config.py）
+        'num_past_poses': dm_config.NUM_PAST_POSES,          # 20
+        'num_future_poses': dm_config.NUM_FUTURE_POSES,      # 60
+        'past_time_horizon': float(dm_config.PAST_TIME_HORIZON),     # 2.0
+        'future_time_horizon': float(dm_config.FUTURE_TIME_HORIZON), # 6.0
 
         # 车辆相关参数
-        'num_agents': 20,          # 最多处理20个其他车辆
+        'num_agents': dm_config.NUM_AGENTS,                  # 20
 
-        # 地图相关参数
-        'map_features': ["LANE", "CROSSWALK", "ROUTE_LANES"],
-        'map_radius': 50.0,        # 地图提取半径(米)
-        'max_elements': {
-            "LANE": 40,
-            "CROSSWALK": 20,
-            "ROUTE_LANES": 20
-        },
-        'max_points': {
-            "LANE": 50,
-            "CROSSWALK": 30,
-            "ROUTE_LANES": 50
-        },
-        'interpolation_method': 'linear'
+        # 地图相关参数（LANE-only，决策A）
+        'map_features': dm_config.MAP_FEATURES,              # ["LANE"]
+        'map_radius': float(dm_config.MAP_RADIUS),           # 50.0
+        'max_elements': dm_config.MAX_ELEMENTS,              # {"LANE": 40}
+        'max_points': dm_config.MAX_POINTS,                  # {"LANE": 50}
+        'interpolation_method': dm_config.INTERPOLATION,     # "linear"
+
+        # route 注入模式（阶段⑬）：'none'=三通道强制全零（复现无 route 旧基线）；
+        # 'three_channel'=启用 proximity/progress/is_on_route。默认 none 保持旧行为。
+        'route_mode': getattr(dm_config, 'ROUTE_MODE', 'none')
     }
 
 
@@ -543,7 +629,7 @@ def demo_process_single_scenario():
             print(f"     [11]  end_time")
 
             # 保存示例结果
-            output_dir = Path(config.PROCESSED_DATA_DIR)
+            output_dir = Path(dm_config.PROCESSED_DATA_DIR)  # 修局部 dict `config` 遮蔽致的 AttributeError
             output_dir.mkdir(parents=True, exist_ok=True)
             output_file = output_dir / "demo_12d_features.pkl"
             feature_df.to_pickle(output_file)

@@ -15,6 +15,8 @@ DIFFUSION_TRAINING_EXPERIMENTS_DIR = os.path.join(BASE_DIR, "experiments", "dang
 DIFFUSION_VISUALIZATION_RESULTS_DIR = os.path.join(BASE_DIR, "experiments", "danger_generation", "visualizations")
 TTC_FILTER_RESULTS_DIR = os.path.join(DANGER_GENERATION_RESULTS_DIR, "ttc_filter_results")
 GENERATED_DANGER_SCENES_DIR = os.path.join(DANGER_GENERATION_RESULTS_DIR, "generated_scenes")
+# 生成结果筛选后的危险场景 benchmark 输出目录（B 线，benchmark_filter）
+BENCHMARK_DIR = os.path.join(DANGER_GENERATION_RESULTS_DIR, "benchmark")
 ALL_RESULTS_DIR = os.path.join(BASE_DIR, "experiments", "analysis", "gnn_trans_ablation")
 ALL_TRAINING_DIR = os.path.join(BASE_DIR, "experiments", "analysis", "training_records")
 COMPARISON_RESULTS_DIR = os.path.join(BASE_DIR, "experiments", "analysis", "comparisons")
@@ -43,35 +45,41 @@ TOTAL_SCENARIOS = 20000000
 
 # === Temporal Configuration ===
 DISCRETE_SIZE = 10  # 帧率：1秒10帧
-PAST_TIME_HORIZON = 4   # 改为4秒历史
+PAST_TIME_HORIZON = 2   # 2秒历史（对齐预处理执行值；模型 ego 分支锁死 20 帧）
 FUTURE_TIME_HORIZON = 6 # 6秒未来
 
-NUM_PAST_POSES = DISCRETE_SIZE * PAST_TIME_HORIZON      # 40帧
+NUM_PAST_POSES = DISCRETE_SIZE * PAST_TIME_HORIZON      # 20帧
 NUM_FUTURE_POSES = DISCRETE_SIZE * FUTURE_TIME_HORIZON  # 60帧
 
 # === Agent / Lane / Map Configuration ===
-NUM_AGENTS = 15
+NUM_AGENTS = 20  # 对齐预处理执行值（原 15）
 
-LANE_NUM = 30
+# --- MAGNET LANE-only 地图契约（决策A：仅 LANE 进 token）---
+LANE_NUM = 40          # 对齐预处理执行值（原 30）
+LANE_POINTS_NUM = 50   # 对齐预处理执行值（原 31）
+
+# --- 以下 route/crosswalk 常量仅供 src/danger_generation/ 旧线脚本消费，MAGNET LANE-only 不使用 ---
 ROUTE_LANES_NUM = 10
 CROSSWALKS_NUM = 5
-
-LANE_POINTS_NUM = 31
 ROUTE_LANES_POINTS_NUM = 51
 CROSSWALKS_POINTS_NUM = 31
 
-NODE_SIZE = (
-    CROSSWALKS_NUM * (CROSSWALKS_POINTS_NUM - 1)
-    + LANE_NUM * (LANE_POINTS_NUM - 1)
-    + ROUTE_LANES_NUM * (ROUTE_LANES_POINTS_NUM - 1)
-    + (NUM_AGENTS + 1) * NUM_PAST_POSES  # agents + ego
-)
+QUERY_RADIUS = 50  # 轨迹/地图提取半径（对齐预处理执行值，原 30）
 
-NUM_GRAPH = (
-    LANE_NUM + ROUTE_LANES_NUM + CROSSWALKS_NUM + NUM_AGENTS + 1
-)
+# === MAGNET LANE-only 地图契约导出（供预处理/编码 import 的唯一源，决策A/C）===
+MAP_FEATURES = ["LANE"]
 
-QUERY_RADIUS = 30  # 轨迹提取半径
+# === route 注入模式（VT-2026-04191 阶段⑬）===
+# 'none'          : lane 节点 col6/col7/col8 强制全 0，与 route 引入前逐字节一致（可复现旧基线）
+# 'three_channel' : col6=route 邻近度, col7=沿 route 进度, col8=is_on_route
+# 预处理与在线 planner 必须使用同一值；训练会把它写入 checkpoint 同目录 train_meta.json，
+# planner 加载时做一致性校验（失配默认 raise）。
+ROUTE_MODES = ("none", "three_channel")
+ROUTE_MODE = "none"
+MAX_ELEMENTS = {"LANE": LANE_NUM}   # 形状对齐 create_default_config 的 dict
+MAX_POINTS = {"LANE": LANE_POINTS_NUM}
+MAP_RADIUS = QUERY_RADIUS
+INTERPOLATION = "linear"
 
 # === Training Configuration ===
 WEIGHT_PATH = os.path.join(DATA_DIR, 'model_weights')

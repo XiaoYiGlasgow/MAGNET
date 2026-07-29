@@ -17,6 +17,9 @@ import config
 # 添加路径
 sys.path.append('/mnt/local/Xiao_Yi/nuplan-devkit')
 sys.path.append('/mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans')
+# 确保同目录(scripts/preprocessing)优先于顶层同名 shim，避免 process_nuplan_to_12d 被遮蔽
+# （经顶层 shim 调用时本目录不在 path 上，sibling import 会错误命中顶层空壳 shim）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
 from nuplan.planning.utils.multithreading.worker_sequential import Sequential
@@ -166,8 +169,14 @@ def batch_process_with_progress(scenario_list: List, config: dict, output_dir: P
     return success_count, failed_count
 
 
-def process_scenarios_by_type(scenario_types: List[str], max_count: int, output_base_dir: str) -> None:
-    """按场景类型处理场景数据"""
+def process_scenarios_by_type(scenario_types: List[str], max_count: int, output_base_dir: str,
+                              offset: int = 0, shard: Optional[int] = None) -> None:
+    """按场景类型处理场景数据。
+
+    分片并行：传 shard（切片大小）时，强制 shuffle=False（确定性顺序，多进程切片不重不漏），
+    每进程只处理该类型 scenarios[offset:offset+shard]。多个分片进程写同一 processed_<type> 目录
+    （token 命名，无文件冲突）。不传 shard 时保持原行为（shuffle=True，处理前 max_count 个）。
+    """
     paths = get_default_paths()
     config = create_default_config()
 
@@ -197,18 +206,21 @@ def process_scenarios_by_type(scenario_types: List[str], max_count: int, output_
         print(f"处理场景类型: {scenario_type}")
         print(f"{'='*60}")
 
+        sharding = shard is not None
+        # 分片时只需取到切片末端（offset+shard），确定性顺序；否则取前 max_count（保留 shuffle）
+        limit = (offset + shard) if sharding else max_count
         scenario_filter = ScenarioFilter(
             scenario_types=[scenario_type],
             scenario_tokens=None,
             log_names=None,
             map_names=None,
             num_scenarios_per_type=None,
-            limit_total_scenarios=max_count,
+            limit_total_scenarios=limit,
             timestamp_threshold_s=None,
             ego_displacement_minimum_m=None,
             expand_scenarios=False,
             remove_invalid_goals=False,
-            shuffle=True
+            shuffle=(not sharding)
         )
 
         try:
@@ -217,11 +229,15 @@ def process_scenarios_by_type(scenario_types: List[str], max_count: int, output_
             print(f"错误：无法获取 {scenario_type} 场景: {e}")
             continue
 
+        if sharding:
+            scenarios = scenarios[offset:offset + shard]
+
         if not scenarios:
-            print(f"警告：没有找到 {scenario_type} 类型的场景")
+            print(f"警告：没有找到 {scenario_type} 类型的场景（offset={offset} shard={shard}）")
             continue
 
-        print(f"找到 {len(scenarios)} 个 {scenario_type} 场景")
+        print(f"找到 {len(scenarios)} 个 {scenario_type} 场景"
+              + (f"（分片 offset={offset} shard={shard}）" if sharding else ""))
 
         # 为每种场景类型创建输出目录
         output_dir = Path(output_base_dir) / f"processed_{scenario_type}"
@@ -256,6 +272,10 @@ def main():
                        help='每种类型处理的最大场景数量')
     parser.add_argument('--output-dir', default=config.PROCESSED_DATA_BY_TYPE_DIR,
                        help='输出目录')
+    parser.add_argument('--offset', type=int, default=0,
+                       help='[分片] 该类型 scenarios 切片起点索引')
+    parser.add_argument('--shard', type=int, default=None,
+                       help='[分片] 切片大小；设了即开分片模式（确定性顺序 shuffle=False，多进程切片并行）')
 
     args = parser.parse_args()
 
@@ -275,7 +295,8 @@ def main():
 
     if args.process:
         print("处理模式：按指定类处理场景数据")
-        process_scenarios_by_type(args.types, args.count, args.output_dir)
+        process_scenarios_by_type(args.types, args.count, args.output_dir,
+                                  offset=args.offset, shard=args.shard)
 
 
 if __name__ == '__main__':

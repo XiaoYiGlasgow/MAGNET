@@ -1,0 +1,25 @@
+{
+  "scheme": "devkit_patches/A",
+  "devkit_root": "/mnt/local/Xiao_Yi/nuplan-devkit",
+  "note": "nuplan-devkit 是零提交仓库；这些文件的权威版本以本目录的 vendor 副本为准，由 sync_devkit_patches.py --check 强制两边逐字节一致。",
+  "files": [
+    {
+      "devkit_relpath": "nuplan/planning/simulation/planner/gnn_trans_planner.py",
+      "vendored": "devkit_patches/files/nuplan__planning__simulation__planner__gnn_trans_planner.py",
+      "sha256": "bc5c7642da44351cfead44723d8b10a04662395bc7dbddddff766f0794c2d0c8",
+      "frozen": false
+    },
+    {
+      "devkit_relpath": "nuplan/planning/script/config/simulation/planner/gnn_trans_planner.yaml",
+      "vendored": "devkit_patches/files/nuplan__planning__script__config__simulation__planner__gnn_trans_planner.yaml",
+      "sha256": "1db0104d19c6014a7f2e9ac82cfcb3f2a877e99b9d4212ef0e0b56084b72e3e8",
+      "frozen": false
+    },
+    {
+      "devkit_relpath": "models/transformer_predictor.py",
+      "vendored": "devkit_patches/files/models__transformer_predictor.py",
+      "sha256": "37c7503b961865617e8de2891d84cb8ea118bf5af3bb97d88cf44a3213f3329d",
+      "frozen": true
+    }
+  ]
+}
