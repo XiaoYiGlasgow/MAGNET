@@ -73,7 +73,7 @@ cd MAGNET
 
 ## nuPlan integration files
 
-Three modified files required by training and online planning are versioned under
+Four modified files required by training and online planning are versioned under
 `devkit_patches/files/`. Inspect them before writing them into a nuPlan checkout.
 
 ```bash
