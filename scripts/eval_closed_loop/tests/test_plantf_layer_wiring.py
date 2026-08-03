@@ -28,7 +28,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-PLANTF_ROOT = Path("/mnt/local/Xiao_Yi/external/planTF")
+PLANTF_ROOT = Path(os.environ.get("PLANTF_ROOT", "/mnt/local/Xiao_Yi/external/planTF"))
+if not (PLANTF_ROOT / "src/planners/magnet_layer_hook.py").is_file():
+    pytest.skip(
+        "PlanTF checkout with the MAGNET integration hook is unavailable",
+        allow_module_level=True,
+    )
 if str(PLANTF_ROOT) not in sys.path:
     sys.path.insert(0, str(PLANTF_ROOT))
 
