@@ -75,20 +75,36 @@ experiments/*
 !experiments/README.md
 outputs/*
 !outputs/README.md
-TTC_filter
-Nuboard
-baselines
-config
-danger_pair_reports
-diffusion_danger_model
-diffusion_training_experiments
-diffusion_visualization_results
-models
-model_weights
-planner
-trajectory_visualization
-utils
-visualization
+# ⚠️ 以下条目全部锚定在仓库根层（前导 `/`）。
+# 它们的目标是根层的 symlink / 本地产物目录（utils -> src/shared/utils 等）。
+# 历史上写成无斜杠的裸模式，而 gitignore 的裸模式**在任意深度匹配**，
+# 导致 src/shared/utils/、src/danger_generation/models/ 等真实源码目录下的
+# **新增**文件被静默忽略（已跟踪的老文件不受影响，所以长期没被发现）。
+# 实际受害者包括 S4-b 的 src/shared/utils/bn_calibration.py 与 svo_torch.py。
+# 修改于 2026-07-30，勿改回裸模式。
+/TTC_filter
+/Nuboard
+/baselines
+/config
+/danger_pair_reports
+/diffusion_danger_model
+/diffusion_training_experiments
+/diffusion_visualization_results
+/models
+/model_weights
+/planner
+/trajectory_visualization
+/utils
+/visualization
+
+# Local backups (改动前备份靠 commit 历史回溯，不入库)
+*.bak
+*.bak_*
+*(backup)*
+*_backup.py
+
+# Local assistant config
+.mcp.json
 
 # Keep ablation code, ignore generated artifacts
 danger_gen_ablation/__pycache__/

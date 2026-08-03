@@ -240,9 +240,20 @@ def train(args: argparse.Namespace) -> None:
     else:
         logger.info("perturbation 增广：关闭（默认，与旧训练命令兼容）")
 
+    # 🔴 生效值 ≠ 原始 flag：context_pooling / ego_query_fusion 都**隐含**打开 follow_batch。
+    #   记录里必须两个都留 —— 只记原始 flag 会让「C2 run 的 GNN 分支是逐样本还是整批共享」
+    #   在事后无法判定（C2 命令行不带 --gnn_pooling_fix，但 GNN 分支实际是逐样本的）。
+    #   闸④（Q50）同理：`MagnetEgoShortcutSuppressed` 也在 `MagnetImitationPooled` 继承链上，
+    #   即使不带 --ego_query_fusion 也隐含逐样本池化 ⇒ 与 B 对照仍差两个变量（Q45 同类坑）。
+    gnn_pooling_fix_effective = bool(
+        args.gnn_pooling_fix or args.context_pooling or args.ego_query_fusion
+        or args.ego_shortcut_suppress)
     train_loader, val_loader, n_train, n_val = build_loaders(
         args.train_root, args.val_root, args.batch_size, args.dataset_config,
-        train_transform=perturb, gnn_pooling_fix=args.gnn_pooling_fix)
+        train_transform=perturb,
+        # context_pooling 走 MagnetContextPooled（继承 MagnetImitationPooled），
+        # 同样需要 follow_batch 产出的 gnn_x_batch，否则父类会走 mean(0).repeat 串样本。
+        gnn_pooling_fix=gnn_pooling_fix_effective)
 
     # 生效副本自证（副本/sys.path 陷阱兜底）
     import inspect
@@ -250,12 +261,46 @@ def train(args: argparse.Namespace) -> None:
     logger.info("GraphDataset       <- %s", inspect.getfile(GraphDataset))
 
     # D0#7：逐样本池化修复（默认关闭 = 旧行为，父类 transformer_predictor.py 一字未改）
-    if args.gnn_pooling_fix:
+    # 判据0：context 分支 polyline 池化（VectorNet 式 encode-then-pool），同样默认关闭。
+    #   实测 context 分支占 99.8% FLOPs（M 中位数 2036 个 segment token，O(M²) 注意力），
+    #   池化到 polyline 级（P 中位数 44）后全模型 FLOPs 7986 -> 50 MFLOP（159×）。
+    #   ⚠️ context_pooling 需要 cluster 且必须与 gnn_pooling_fix 一起用（子类继承关系）。
+    # C2（阶段㊵–㊹）：ego-query attention 融合，替代两处 mean pooling。
+    #   靶点由 G19+G16 三条独立证据锁定；🔴 **必须与非完全图（--dataset_config nearby_only）同用** ——
+    #   完全图上 GCN 一层即过平滑（真实 ckpt 实测 conv1 后节点间最大差 ~1e-7），
+    #   GNN 分支的信息在池化之前就已销毁，融合层面的修复救不了它（单测判据 D/E 已固化该性质）。
+    # 闸④（Q50）：切断 ego 捷径。`MagnetEgoShortcutSuppressed` 是 MagnetEgoQueryFusion 的子类
+    #   ⇒ **必须排在 ego_query_fusion 之前**，否则带 shortcut 的 run 会被建成父类。
+    #   ⚠️ §7：闸④ 是 PlanTF `2309.10443` 已发表贡献的移植，只作对照格，不得写成本文方法。
+    if args.ego_shortcut_suppress:
+        from magnet_ego_shortcut import MagnetEgoShortcutSuppressed
+        model = MagnetEgoShortcutSuppressed(context_pooling=args.context_pooling,
+                                            context_pool_mode=args.context_pool_mode,
+                                            ego_query_fusion=args.ego_query_fusion,
+                                            ego_query_heads=args.ego_query_heads,
+                                            use_ego_history=False,
+                                            ego_state_dropout=args.ego_state_dropout).to(device)
+    elif args.ego_query_fusion:
+        from magnet_ego_query_fusion import MagnetEgoQueryFusion
+        model = MagnetEgoQueryFusion(context_pooling=args.context_pooling,
+                                     context_pool_mode=args.context_pool_mode,
+                                     ego_query_fusion=True,
+                                     ego_query_heads=args.ego_query_heads).to(device)
+    elif args.context_pooling:
+        from magnet_context_pooled import MagnetContextPooled
+        model = MagnetContextPooled(context_pooling=True,
+                                    context_pool_mode=args.context_pool_mode).to(device)
+    elif args.gnn_pooling_fix:
         from magnet_imitation_pooled import MagnetImitationPooled
         model = MagnetImitationPooled().to(device)
     else:
         model = TransformerPredictor().to(device)
-    logger.info("model <- %s (gnn_pooling_fix=%s)", type(model).__name__, args.gnn_pooling_fix)
+    logger.info("model <- %s (gnn_pooling_fix=%s/eff=%s, context_pooling=%s/%s, "
+                "ego_query_fusion=%s/%s heads, ego_shortcut_suppress=%s/dropout=%s)",
+                type(model).__name__, args.gnn_pooling_fix, gnn_pooling_fix_effective,
+                args.context_pooling, args.context_pool_mode,
+                args.ego_query_fusion, args.ego_query_heads,
+                args.ego_shortcut_suppress, args.ego_state_dropout)
     criterion = ImprovedTrajectoryLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3, betas=(0.9, 0.999))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.7, patience=3, min_lr=1e-6)
@@ -288,7 +333,14 @@ def train(args: argparse.Namespace) -> None:
                         "optimizer_state_dict": optimizer.state_dict(), "best_val_loss": best_val,
                         "val_ade": va_ade, "val_fde": va_fde, "seed": args.seed,
                         "dataset_config": args.dataset_config, "env": env,
-                        "gnn_pooling_fix": bool(args.gnn_pooling_fix)}, best_ckpt)
+                        "gnn_pooling_fix": bool(args.gnn_pooling_fix),
+                        "gnn_pooling_fix_effective": gnn_pooling_fix_effective,
+                        "context_pooling": bool(args.context_pooling),
+                        "context_pool_mode": args.context_pool_mode,
+                        "ego_query_fusion": bool(args.ego_query_fusion),
+                        "ego_query_heads": args.ego_query_heads,
+                        "ego_shortcut_suppress": bool(args.ego_shortcut_suppress),
+                        "ego_state_dropout": args.ego_state_dropout}, best_ckpt)
 
         if stopper(va_loss, model):
             logger.info("early stopping @ epoch %d", epoch + 1)
@@ -304,7 +356,16 @@ def train(args: argparse.Namespace) -> None:
         "dataset_config": args.dataset_config, "seed": args.seed, "lr": args.lr,
         "batch_size": args.batch_size, "env": env, "history": history,
         "route_mode": args.route_mode,
-        "gnn_pooling_fix": bool(args.gnn_pooling_fix),   # D0#7：事后区分两种 run 的唯一依据
+        "gnn_pooling_fix": bool(args.gnn_pooling_fix),   # D0#7：命令行原始 flag
+        # 🔴 GNN 分支语义的**唯一可信依据**：True=逐样本 global_mean_pool，
+        #    False=整批塌成一向量再 repeat（transformer_predictor.py:270-271）。
+        "gnn_pooling_fix_effective": gnn_pooling_fix_effective,
+        "context_pooling": bool(args.context_pooling),   # 判据0：区分池化线的唯一依据
+        "context_pool_mode": args.context_pool_mode,
+        "ego_query_fusion": bool(args.ego_query_fusion), # C2：区分融合算子的唯一依据
+        "ego_query_heads": args.ego_query_heads,
+        "ego_shortcut_suppress": bool(args.ego_shortcut_suppress),  # 闸④：区分 ego 通路的唯一依据
+        "ego_state_dropout": args.ego_state_dropout,
         "perturbation": {
             "enabled": bool(args.use_perturbation),
             "prob": args.perturb_prob, "max_lateral": args.max_lateral,
@@ -326,6 +387,24 @@ def train(args: argparse.Namespace) -> None:
         "val_root": args.val_root,
         "best_val_loss": best_val,
         "env": env,
+        # 🔴 架构块：**推理侧重建模型的唯一依据**。
+        #   calibrated 产物是 bare state_dict（无 provenance），而 `ego_query_heads` 这类参数
+        #   **无法从权重形状反推**（MultiheadAttention 的 in_proj_weight 形状与 heads 无关）——
+        #   少了它 `load_state_dict` 仍会成功，但模型算的是另一回事，属静默错模型。
+        #   `bn_calibration.build_model` 按本块重建；改字段名要两边同步。
+        "architecture": {
+            "class": type(model).__name__,
+            "gnn_pooling_fix": bool(args.gnn_pooling_fix),
+            "gnn_pooling_fix_effective": gnn_pooling_fix_effective,
+            "context_pooling": bool(args.context_pooling),
+            "context_pool_mode": args.context_pool_mode,
+            "ego_query_fusion": bool(args.ego_query_fusion),
+            "ego_query_heads": args.ego_query_heads,
+            # 闸④：`ego_state_dropout` 与 heads 同理无法从权重形状反推（只影响训练期采样），
+            #   但 `build_model` 的构造签名需要它，缺了会用默认值建出「另一个模型」的 provenance。
+            "ego_shortcut_suppress": bool(args.ego_shortcut_suppress),
+            "ego_state_dropout": args.ego_state_dropout,
+        },
     }
     with open(out_dir / "models" / "train_meta.json", "w", encoding="utf-8") as f:
         json.dump(train_meta, f, ensure_ascii=False, indent=2)
@@ -361,6 +440,31 @@ def parse_args() -> argparse.Namespace:
                    help="扰动采样器 seed；默认取实验 --seed，保证同 seed 可复现")
     p.add_argument("--gnn_pooling_fix", action="store_true",
                    help="D0#7：GNN 分支逐样本池化（默认关闭 = 旧行为，逐字节一致）")
+    p.add_argument("--context_pooling", action="store_true",
+                   help="判据0：context 分支 polyline 池化（VectorNet 式 encode-then-pool）。"
+                        "全模型 FLOPs 7986->50 MFLOP（159×）。隐含开启 gnn_pooling_fix 的 follow_batch。"
+                        "⚠️ 与现有 12 格 ckpt 不可比，属独立实验线")
+    p.add_argument("--context_pool_mode", default="max", choices=["max", "mean"],
+                   help="polyline 池化方式；VectorNet 原文用 max（默认）")
+    p.add_argument("--ego_query_fusion", action="store_true",
+                   help="C2 靶向修复：以 ego 表征为 query 的注意力池化，替代 context/gnn 两处 "
+                        "mean pooling（transformer_predictor.py:53 与 :239）。默认关闭时与父类逐字节一致。"
+                        "🔴 必须与 --dataset_config nearby_only 同用：完全图上 GCN 一层即过平滑，"
+                        "GNN 分支信息在池化前已销毁，融合修复救不了它。"
+                        "⚠️ §7：attention 融合非本文提出，须显式引用 VectorNet/HDGT/PlanTF")
+    p.add_argument("--ego_query_heads", type=int, default=4,
+                   help="ego-query 注意力头数（默认 4）")
+    p.add_argument("--ego_shortcut_suppress", action="store_true",
+                   help="闸④（Q50）：切断 ego 捷径 —— ego 分支不读 EGO_HISTORY 的历史轨迹，"
+                        "改由最后两帧增量导出的 6 通道当前状态 + state dropout 编码。"
+                        "默认关闭时与 MagnetEgoQueryFusion 逐字节一致（单测判据 A）。"
+                        "⚠️ §7：本闸是 PlanTF `2309.10443` 已发表贡献的移植，**零 novelty**，"
+                        "论文里只能作 baseline/对照格，不得写成本文提出的方法。"
+                        "⚠️ 打开后 ego 分支不再经过 ego_history_encoder 的 BatchNorm ⇒ "
+                        "D0#13 的 batch 口径断层在本变体上自动消失，BN calibration 对 ego 分支成为空操作"
+                        "（副作用，不是贡献）")
+    p.add_argument("--ego_state_dropout", type=float, default=0.75,
+                   help="闸④ 的 state dropout 概率（PlanTF 用 0.75）；仅 train 模式生效")
     return p.parse_args()
 
 

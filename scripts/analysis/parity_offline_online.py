@@ -23,13 +23,23 @@ past API。本脚本用 **同一个 scenario 的 past** 造 history，使两条�
 
 必须覆盖的四类 edge case（阶段15 Z5 验收）
 ------------------------------------------
-    empty_route        route 信号全 0（实测约 11.8% 样本）
+    empty_route        lane 行的 route 信号全 0（实测约 11.8% 样本）
     connector          场景内含 lane connector（路口）
     lane_overflow      lane 数 > config.LANE_NUM=40，发生截断（实测约 19.9%）
-    route_truncated    有 route lane，但全部落在按距离排序的前 40 之外 -> 三通道全 0
+    route_truncated    有 route roadblock，但没有一条 on-route lane 进入最终 40 条 -> 三通道全 0
 
-前三类靠随机抽样即可命中；`route_truncated` 稀有，脚本会**显式扫描**直到找到或扫完预算，
-没找到就在报告里标 `NOT_COVERED`，**不假装覆盖过**。
+`connector` / `lane_overflow` 靠随机抽样即可命中；`empty_route` / `route_truncated` 稀有，
+由 `--edge_scan N` **离线扫描 pkl**（只读 `POLYLINE_FEATURES`，不碰 nuPlan DB）定向找出
+候选 token 并追加进本轮审计；也可以用 `--tokens` 手工指定。没找到就在报告里标
+`NOT_COVERED`，**不假装覆盖过**。
+
+⚠️ 2026-07-29 修正（D0#3 / D0#6）：原实现在**全部节点行**上数 `col8>0.5` 来判 `empty_route`。
+但 schema v2 的 col6/7/8 语义**按 node type 分岔** —— ego/agent 行是 `timestamp/v_start/v_end`，
+只有 lane 行才是 route 三通道。ego 行的 `v_end` 通常是十几 m/s，恒 >0.5，
+于是 `empty_route` **在结构上永远不可能被触发**（两次审计报 0/30 是这个 bug，不是抽样运气）。
+现在改为只在 lane 行上判定（lane 行由 `SUBGRAPH_ID_TO_TYPE` + col9 subgraph_id 确定）。
+同时原 docstring 声称对 `route_truncated` 做「显式扫描」而 `main()` 只随机抽样，
+该文档—代码冲突由本次的 `--edge_scan` 实装消除。
 
 用法
 ----
@@ -173,19 +183,46 @@ def compare_route_channels(off_x, on_x, cluster_off, cluster_on) -> List[FieldDi
     return out
 
 
-def classify_buckets(x_off: np.ndarray, n_lanes_in_radius: Optional[int],
-                     n_route_lane_ids: Optional[int], has_connector: Optional[bool],
-                     lane_num: int) -> List[str]:
-    """给一个样本打 edge-case 标签，用于覆盖率统计。"""
-    buckets: List[str] = []
-    route = x_off[:, list(ROUTE_COLS)]
-    on_route_rows = int((route[:, 2] > 0.5).sum())     # col8 = is_on_route
+def lane_row_mask(x_off, subgraph_types: Optional[Dict]) -> Optional[np.ndarray]:
+    """哪些行是 lane 行 —— route 三通道只在 lane 行上有意义（schema v2 §1）。
 
-    if on_route_rows == 0:
-        buckets.append("empty_route")
-        # 有 route lane id 却一条都没进最终 40 条 -> 被距离排序截断掉了
-        if n_route_lane_ids:
-            buckets.append("route_truncated")
+    `x` 的 col9 是**原始 subgraph_id**（不是 GraphData.cluster 的重编号），
+    `SUBGRAPH_ID_TO_TYPE` 把它映射到 'ego'/'agent'/'lane'。
+    映射缺失就返回 None（宁可标"未知"也不猜）。
+    """
+    a = _as_np(x_off)
+    if a is None or not subgraph_types:
+        return None
+    sub = a[:, CLUSTER_COL].astype(np.int64)
+    known = set(int(k) for k in subgraph_types.keys())
+    if not set(int(s) for s in sub).issubset(known):
+        return None
+    return np.asarray([str(subgraph_types[int(s)]).lower() == "lane" for s in sub], dtype=bool)
+
+
+def classify_buckets(x_off: np.ndarray, lane_mask: Optional[np.ndarray],
+                     n_lanes_in_radius: Optional[int],
+                     n_route_lanes_in_radius: Optional[int], has_connector: Optional[bool],
+                     lane_num: int) -> List[str]:
+    """给一个样本打 edge-case 标签，用于覆盖率统计。
+
+    ⚠️ `empty_route` 必须只在 **lane 行**上判：ego/agent 行的 col8 是 `v_end`(m/s)，
+    与 `is_on_route` 无关，混在一起数会让 `empty_route` 永不触发（2026-07-29 修正）。
+    """
+    buckets: List[str] = []
+    if lane_mask is None:
+        buckets.append("route_bucket_unknown")     # 不猜，也不算覆盖
+    else:
+        lane_rows = x_off[lane_mask]
+        if lane_rows.shape[0] == 0:
+            buckets.append("no_lane_rows")
+        else:
+            on_route_rows = int((lane_rows[:, ROUTE_COLS[2]] > 0.5).sum())  # col8 = is_on_route
+            if on_route_rows == 0:
+                buckets.append("empty_route")
+                # 半径内确实有 route lane，却一条都没进最终 40 条 -> 被距离排序截断掉了
+                if n_route_lanes_in_radius:
+                    buckets.append("route_truncated")
     if has_connector:
         buckets.append("connector")
     if n_lanes_in_radius is not None and n_lanes_in_radius > lane_num:
@@ -193,18 +230,69 @@ def classify_buckets(x_off: np.ndarray, n_lanes_in_radius: Optional[int],
     return buckets
 
 
+def scan_empty_route_tokens(pkl_root: Path, rows: List[Dict[str, str]], budget: int,
+                            want: int) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
+    """离线定向扫描：只读 pkl 的 `POLYLINE_FEATURES`，找 lane 行 route 信号全 0 的 token。
+
+    不访问 nuPlan DB，也不构图 —— 因此可以在几百个样本上快速扫，用来把稀有的
+    `empty_route` / `route_truncated` 定向喂进审计（docstring 承诺的「显式扫描」的实装）。
+
+    命中后**按 lane 子图数降序**挑选：`route_truncated` 只可能发生在 lane 数触到
+    `LANE_NUM=40` 上限、on-route lane 被距离排序挤出去的样本上；没触到上限就不存在截断。
+    lane 子图数离线可读，用它排序能显著提高稀有桶的命中率。
+
+    :return: (命中的 manifest 行, 扫描统计)
+    """
+    import pandas as pd
+
+    pool: List[Tuple[int, Dict[str, str]]] = []
+    stat = {"scanned": 0, "missing_pkl": 0, "unreadable": 0, "hit": 0}
+    for row in rows:
+        if stat["scanned"] >= budget:
+            break
+        pkl_path = pkl_root / f"features_{row['token']}.pkl"
+        if not pkl_path.exists():
+            stat["missing_pkl"] += 1
+            continue
+        stat["scanned"] += 1
+        try:
+            df = pd.read_pickle(pkl_path)
+            feats = np.asarray(df["POLYLINE_FEATURES"].values[0])
+            types = df["SUBGRAPH_ID_TO_TYPE"].values[0]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("扫描读 pkl 失败 %s: %s", pkl_path.name, exc)
+            stat["unreadable"] += 1
+            continue
+        mask = lane_row_mask(feats, types)
+        if mask is None or mask.sum() == 0:
+            continue
+        if int((feats[mask][:, ROUTE_COLS[2]] > 0.5).sum()) == 0:
+            n_lane_subgraphs = int(np.unique(feats[mask][:, CLUSTER_COL].astype(np.int64)).size)
+            pool.append((n_lane_subgraphs, row))
+            stat["hit"] += 1
+    # lane 子图数越接近 LANE_NUM 上限，越可能是真正的 route_truncated 而非"附近本无 route"
+    pool.sort(key=lambda item: -item[0])
+    hits = [row for _, row in pool[:want]]
+    stat["lane_subgraphs_of_picked"] = [n for n, _ in pool[:want]]
+    return hits, stat
+
+
 # --------------------------------------------------------------------------- 两条路径
 
 
 def build_offline(pkl_path: Path, adjacency_config: str):
-    """离线：pkl -> GraphData（与 GraphDataset.process() 逐字节同一路径）。"""
+    """离线：pkl -> GraphData（与 GraphDataset.process() 逐字节同一路径）。
+
+    额外返回 `SUBGRAPH_ID_TO_TYPE`，供 edge-case 分桶区分 lane 行与 ego/agent 行。
+    """
     import pandas as pd
 
     from src.shared.utils.dataset import build_graph_data_from_feature_df
 
     df = pd.read_pickle(pkl_path)
     graph, skip = build_graph_data_from_feature_df(df, adjacency_config)
-    return graph, skip
+    types = df["SUBGRAPH_ID_TO_TYPE"].values[0] if "SUBGRAPH_ID_TO_TYPE" in df.columns else None
+    return graph, skip, types
 
 
 def build_online(scenario, route_mode: str, adjacency_config: str, checkpoint_path: str):
@@ -316,7 +404,7 @@ def audit_token(token: str, log_name: str, pkl_root: Path, scenario,
         result.skipped, result.ok = "missing_pkl", False
         return result
 
-    off, skip = build_offline(pkl_path, adjacency_config)
+    off, skip, subgraph_types = build_offline(pkl_path, adjacency_config)
     if off is None:
         result.skipped, result.ok = f"offline_skipped:{skip}", False
         return result
@@ -335,26 +423,34 @@ def audit_token(token: str, log_name: str, pkl_root: Path, scenario,
                                            getattr(off, "cluster", None), getattr(on, "cluster", None)):
             result.add(diff)
 
-    n_lanes, has_connector = _scene_topology(scenario)
+    n_lanes, has_connector, n_route_lanes = _scene_topology(scenario)
     result.buckets = classify_buckets(
-        _as_np(off.x), n_lanes_in_radius=n_lanes,
-        n_route_lane_ids=len(scenario.get_route_roadblock_ids() or []),
+        _as_np(off.x), lane_row_mask(off.x, subgraph_types), n_lanes_in_radius=n_lanes,
+        n_route_lanes_in_radius=n_route_lanes,
         has_connector=has_connector, lane_num=_gnn_config().LANE_NUM,
     )
     return result
 
 
-def _scene_topology(scenario) -> Tuple[Optional[int], Optional[bool]]:
-    """半径内的 lane 条数与是否含 lane connector —— 用于 edge-case 分桶，不参与 parity 判定。
+def _scene_topology(scenario) -> Tuple[Optional[int], Optional[bool], Optional[int]]:
+    """半径内的 lane 条数 / 是否含 lane connector / 半径内的 route lane 条数。
+
+    只用于 edge-case 分桶，不参与 parity 判定。
 
     lane 条数走 planner 用的同一个 `get_neighbor_vector_set_map`（截断前的原始条数，
-    所以 `>LANE_NUM` 才等价于「发生了截断」）；connector 走地图层查询。
+    所以 `>LANE_NUM` 才等价于「发生了截断」）；connector 走地图层查询；
+    route lane 条数走**预处理同一个** `get_route_lane_progress`。
+
+    ⚠️ `route_truncated` 必须用「**半径内**的 route lane 数」而不是「route_roadblock_ids 非空」：
+    后者在 route 整体不在 ego 50 m 内时也非空，会把「附近本来就没有 route」误报成
+    「被 LANE_NUM=40 截断」，属于虚报覆盖（2026-07-29 修正）。
+
     任一查询失败都返回 None 而不是猜一个值 —— 分桶宁可标"未知"，也不能虚报覆盖。
     """
     from nuplan.common.actor_state.state_representation import Point2D
     from nuplan.common.maps.maps_datatypes import SemanticMapLayer
 
-    from src.shared.utils.data_utils import get_neighbor_vector_set_map
+    from src.shared.utils.data_utils import get_neighbor_vector_set_map, get_route_lane_progress
 
     cfg = _gnn_config()
     ego = scenario.initial_ego_state.rear_axle
@@ -375,7 +471,14 @@ def _scene_topology(scenario) -> Tuple[Optional[int], Optional[bool]]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("connector 查询失败 token=%s: %s", scenario.token, exc)
         has_connector = None
-    return n_lanes, has_connector
+    try:
+        progress = get_route_lane_progress(
+            scenario.map_api, point, cfg.MAP_RADIUS, scenario.get_route_roadblock_ids() or [])
+        n_route_lanes: Optional[int] = len(progress)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("route lane 计数失败 token=%s: %s", scenario.token, exc)
+        n_route_lanes = None
+    return n_lanes, has_connector, n_route_lanes
 
 
 def dry_run() -> int:
@@ -410,13 +513,27 @@ def dry_run() -> int:
     assert not compare_tensor("value", a, b).ok
     print("  ✅ 比对原语：同值通过 / 形状不同失败 / 1e-3 偏差失败")
 
+    # 行 0-1 = ego/agent（col8 = v_end，与 route 无关），行 2-4 = lane
+    lane_mask = np.array([False, False, True, True, True])
     x = np.zeros((5, 12), dtype=np.float32)
-    x[1, 8] = 1.0
-    assert "empty_route" not in classify_buckets(x, None, 3, None, 40)
-    assert "empty_route" in classify_buckets(np.zeros((5, 12), np.float32), None, 0, None, 40)
-    assert "route_truncated" in classify_buckets(np.zeros((5, 12), np.float32), None, 3, None, 40)
-    assert "lane_overflow" in classify_buckets(x, 55, 3, None, 40)
+    x[0, 8] = 14.0                       # ego 时速 14 m/s —— 绝不能被当成 on-route
+    assert "empty_route" in classify_buckets(x, lane_mask, None, 0, None, 40)
+    assert "route_truncated" in classify_buckets(x, lane_mask, None, 3, None, 40)
+    x_on = x.copy(); x_on[3, 8] = 1.0    # 一条 lane 在 route 上
+    assert "empty_route" not in classify_buckets(x_on, lane_mask, None, 3, None, 40)
+    assert "route_truncated" not in classify_buckets(x_on, lane_mask, None, 3, None, 40)
+    assert "lane_overflow" in classify_buckets(x_on, lane_mask, 55, 3, None, 40)
+    assert "route_bucket_unknown" in classify_buckets(x, None, None, 3, None, 40)
     print("  ✅ edge-case 分类：empty_route / route_truncated / lane_overflow 判定正确")
+    print("     ✅ 回归：ego 行 col8=14 m/s 不再被误当作 on-route（2026-07-29 修正的 bug）")
+
+    # lane_row_mask：col9=subgraph_id -> SUBGRAPH_ID_TO_TYPE
+    xm = np.zeros((4, 12), dtype=np.float32)
+    xm[:, CLUSTER_COL] = [0, 1, 7, 7]
+    assert list(lane_row_mask(xm, {0: "ego", 1: "agent", 7: "lane"})) == [False, False, True, True]
+    assert lane_row_mask(xm, {0: "ego"}) is None          # 映射缺失 -> 不猜
+    assert lane_row_mask(xm, None) is None
+    print("  ✅ lane 行掩码：按 SUBGRAPH_ID_TO_TYPE 区分 ego/agent/lane，映射缺失返回 None")
 
     print("-" * 70)
     print(" dry run " + ("通过 —— 可以跑真实审计" if ok else "失败"))
@@ -433,6 +550,10 @@ def parse_args() -> argparse.Namespace:
                    help="仅为构造 planner；本脚本不加载权重")
     p.add_argument("--n", type=int, default=20, help="随机抽多少 token")
     p.add_argument("--tokens", type=str, default=None, help="逗号分隔，显式指定 token（覆盖 --n）")
+    p.add_argument("--edge_scan", type=int, default=600,
+                   help="离线扫描多少个 pkl 定向找 empty_route/route_truncated（0=关闭，不碰 DB）")
+    p.add_argument("--edge_scan_want", type=int, default=3,
+                   help="定向补进来的 empty_route token 上限")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=Path, default=None)
     p.add_argument("--dry_run", action="store_true", help="只做接线自检，不访问 DB")
@@ -446,14 +567,35 @@ def main() -> int:
     if args.pkl_root is None:
         raise SystemExit("--pkl_root 必填（除非 --dry_run）")
 
-    rows = load_manifest(args.pkl_root)
+    all_rows = load_manifest(args.pkl_root)
+    scan_stat: Dict[str, object] = {"enabled": False}
     if args.tokens:
         want = {t.strip() for t in args.tokens.split(",") if t.strip()}
-        rows = [r for r in rows if r["token"] in want]
+        rows = [r for r in all_rows if r["token"] in want]
+        missing = want - {r["token"] for r in rows}
+        if missing:
+            logger.warning("manifest 里没有这些 token: %s", sorted(missing))
+        scan_stat = {"enabled": False, "reason": "--tokens 显式指定，跳过定向扫描"}
     else:
-        random.Random(args.seed).shuffle(rows)
-        rows = rows[: args.n]
-    logger.info("待审计 %d 个 token", len(rows))
+        shuffled = list(all_rows)
+        random.Random(args.seed).shuffle(shuffled)
+        rows = shuffled[: args.n]
+        # 定向扫描：随机抽样命中不了的稀有桶（empty_route / route_truncated）从剩余样本里补
+        if args.edge_scan > 0 and args.edge_scan_want > 0:
+            t_scan = time.time()
+            hits, stat = scan_empty_route_tokens(
+                args.pkl_root, shuffled[args.n:], budget=args.edge_scan, want=args.edge_scan_want)
+            already = {r["token"] for r in rows}
+            hits = [h for h in hits if h["token"] not in already]
+            rows = rows + hits
+            scan_stat = {"enabled": True, "budget": args.edge_scan, "want": args.edge_scan_want,
+                         "added_tokens": [h["token"] for h in hits],
+                         "seconds": round(time.time() - t_scan, 1), **stat}
+            logger.info("定向扫描: 扫 %d 个 pkl，命中 %d 个 empty_route 候选，用时 %.0fs",
+                        stat["scanned"], len(hits), time.time() - t_scan)
+    logger.info("待审计 %d 个 token（随机 %d + 定向 %d）", len(rows),
+                len(rows) - len(scan_stat.get("added_tokens", []) or []),
+                len(scan_stat.get("added_tokens", []) or []))
 
     t0 = time.time()
     scenarios = get_scenarios_for(rows)
@@ -471,7 +613,16 @@ def main() -> int:
         "atol": ATOL,
         "n_tokens": len(results),
         "n_fail": n_fail,
+        "edge_case_scan": scan_stat,
         "edge_case_coverage": coverage,
+        # route 相关的桶在 route_mode=none 下是退化的：三通道按定义恒 0，于是**每个**样本
+        # 都是 empty_route。此时"覆盖"是平凡真，不能当成对 route 链路的检验。
+        "route_bucket_note": (
+            "route_mode=none：lane 三通道按定义恒 0 -> empty_route/route_truncated 平凡覆盖，"
+            "不构成对 route 链路的检验；这两个桶的实质覆盖只看 three_channel 的报告"
+            if args.route_mode == "none" else
+            "route_mode=three_channel：empty_route/route_truncated 为实质覆盖"
+        ),
         "edge_cases_not_covered": [c for c, n in coverage.items() if n == 0],
         "results": [{"token": r.token, "log_name": r.log_name, "ok": r.ok,
                      "skipped": r.skipped, "buckets": r.buckets,

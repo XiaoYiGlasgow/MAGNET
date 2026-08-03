@@ -66,6 +66,7 @@ OPEN_SOURCE_PATHS=(
     "scripts/training/split_log_disjoint3.py"
     "scripts/training/tests/test_gnn_pooling.py"
     "scripts/training/tests/test_perturbation.py"
+    "scripts/training/tests/test_splitter_yaml_split.py"
     "scripts/training/train_magnet_imitation.py"
     "devkit_patches/"
     "train.py"

@@ -6,22 +6,36 @@ seed-paired factorial analysis required by 阶段15 §5.1 (Z1).
 Hard rules enforced by this script
 ----------------------------------
 1. Metrics come **only** from ``models/checkpoint_best.pt`` (the model that was
-   actually saved).  ``loss_record.json`` also stores ``best_val_ade`` /
-   ``best_val_fde``, but those are the independent minima of two separate
-   curves and generally correspond to *no* saved model.  Using them is
-   forbidden by the project contract; this script refuses to read them.
-2. Effects are computed **seed-paired**: every contrast is formed within a seed
-   first, then aggregated across seeds.  Cross-seed unpaired means are never
-   reported as effects.
-3. Primary inference is a paired bootstrap / exact permutation CI.  Paired
-   t-test and Wilcoxon are reported only as sensitivity checks, because n=3..5
-   has almost no power to check normality.
-4. Holm correction is applied across the reported metrics.
-5. ``p > 0.05`` is never rendered as "equivalent".
+   actually saved), or — under the S4-b inference contract — from calibrated
+   re-evaluation JSONs supplied via ``--metrics_json_dir``.  ``loss_record.json``
+   stores ``best_val_ade``/``best_val_fde``, which are the independent minima of
+   two separate curves and generally correspond to *no* saved model; reading
+   them is forbidden by the project contract.
+2. Effects are computed **seed-paired** (S5): every contrast is formed within a
+   seed first, then aggregated across seeds.  Cross-seed unpaired means are
+   never reported as effects.
+3. **Q11**: Route and Perturbation on the primary metric are the only two
+   confirmatory hypotheses.  They use a **one-sided** exact sign-flip test in
+   the pre-registered direction (improvement = negative), and Holm correction is
+   applied **only across those two**.  Everything else (FDE, interaction) is
+   exploratory and reported with two-sided p, outside the Holm family.
+4. **D0#14**: ``ci_excludes_zero ∧ all_seeds_same_sign`` is mathematically one
+   criterion (same-sign ⟹ CI excludes zero) with a null false-positive rate of
+   ≈2/2^n — identical to the permutation-p floor.  It is therefore kept as a
+   *diagnostic* field only and must not be used as a decision gate.
+5. **D0#15**: main effects are on the "per-factor level switch" scale (divided
+   by 2), the interaction is on the difference-in-differences scale (not
+   divided).  The two scales differ by 2.0×, so Route/Perturbation/interaction
+   each need their own δ; they must never share one threshold.
+6. **D0#16**: in ``--formal`` mode the expected seed list and epoch budget must
+   be passed explicitly; falling back to an overwritable ``<stage>_summary.json``
+   is refused, because a queue that rewrites it silently under-reports gaps.
+7. ``p > 0.05`` is never rendered as "equivalent".
 
 Usage
 -----
-    python3 agg_2x2.py --stage_dir <.../experiments/ablation_2x2/dev> \
+    python3 agg_2x2.py --stage_dir <.../experiments/ablation_2x2_f1/dev> \
+                       --seeds 42,1,2 --epoch_budget 45 \
                        --out <.../dev_summary_stats.json>
 """
 
@@ -51,6 +65,18 @@ CELLS: Dict[str, Tuple[str, bool]] = {
 METRICS: Tuple[str, ...] = ("ade", "fde")
 N_BOOTSTRAP = 20000
 MAX_EXACT_PERM = 2 ** 14  # exact sign-flip permutation up to 14 seeds
+
+#: Q11：confirmatory family = 主指标上的两个主效应，其余全部 exploratory
+PRIMARY_METRIC = "ade"
+PRIMARY_EFFECTS: Tuple[str, ...] = ("route_main_effect", "perturbation_main_effect")
+#: 预注册方向：ADE/FDE 越低越好 ⇒ 改善 = 负
+PREREGISTERED_DIRECTION = "negative"
+#: D0#15：三个 estimand 的尺度不同，δ 不可共用
+EFFECT_SCALE: Dict[str, str] = {
+    "route_main_effect": "per-factor level switch (÷2)",
+    "perturbation_main_effect": "per-factor level switch (÷2)",
+    "interaction": "difference-in-differences (未除 2，约为主效应尺度的 2×)",
+}
 
 
 @dataclass(frozen=True)
@@ -181,20 +207,38 @@ def _paired_bootstrap_ci(diffs: np.ndarray, alpha: float = 0.05,
     return float(lo), float(hi)
 
 
-def _sign_flip_p(diffs: np.ndarray) -> float:
-    """Two-sided exact sign-flip permutation test on paired differences."""
+def _sign_flip_null(diffs: np.ndarray) -> np.ndarray:
+    """Sign-flip null distribution of the mean paired difference (exact when feasible)."""
     n = len(diffs)
-    if n == 0:
-        return float("nan")
-    observed = abs(diffs.mean())
     if 2 ** n <= MAX_EXACT_PERM:
         signs = np.array(list(itertools.product([1.0, -1.0], repeat=n)))
-        stats = np.abs((signs * diffs).mean(axis=1))
-        return float((stats >= observed - 1e-15).mean())
-    rng = np.random.default_rng(0)
-    signs = rng.choice([1.0, -1.0], size=(N_BOOTSTRAP, n))
-    stats = np.abs((signs * diffs).mean(axis=1))
-    return float((stats >= observed - 1e-15).mean())
+    else:
+        signs = np.random.default_rng(0).choice([1.0, -1.0], size=(N_BOOTSTRAP, n))
+    return (signs * diffs).mean(axis=1)
+
+
+def _sign_flip_p(diffs: np.ndarray) -> float:
+    """Two-sided exact sign-flip permutation test — exploratory items only (Q11)."""
+    if len(diffs) == 0:
+        return float("nan")
+    null = _sign_flip_null(diffs)
+    return float((np.abs(null) >= abs(diffs.mean()) - 1e-15).mean())
+
+
+def _sign_flip_p_one_sided(diffs: np.ndarray, direction: str = PREREGISTERED_DIRECTION) -> float:
+    """One-sided exact sign-flip test in the **pre-registered** direction (Q11).
+
+    ``direction='negative'`` ⇒ H1: mean paired contrast < 0 (ADE/FDE improvement).
+    With n=6 the raw p floor is ``1/64 = 0.015625``; after Holm over the two
+    primary hypotheses the floor is ``0.03125``.
+    """
+    if len(diffs) == 0:
+        return float("nan")
+    null = _sign_flip_null(diffs)
+    observed = diffs.mean()
+    if direction == "negative":
+        return float((null <= observed + 1e-15).mean())
+    return float((null >= observed - 1e-15).mean())
 
 
 def _sensitivity_tests(diffs: np.ndarray) -> Dict[str, Optional[float]]:
@@ -212,7 +256,13 @@ def _sensitivity_tests(diffs: np.ndarray) -> Dict[str, Optional[float]]:
     return out
 
 
-def _effect(diffs: np.ndarray, seeds: Sequence[int]) -> Dict[str, object]:
+def _effect(diffs: np.ndarray, seeds: Sequence[int], name: str,
+            confirmatory: bool) -> Dict[str, object]:
+    """One seed-paired contrast.
+
+    :param confirmatory: True 只对主指标上的两个主效应成立（Q11）；决定 `p_primary_one_sided`
+        是否参与 Holm family，也决定报表里怎么标注。
+    """
     lo, hi = _paired_bootstrap_ci(diffs)
     same_sign = bool(len(diffs) > 0 and (np.all(diffs > 0) or np.all(diffs < 0)))
     sd = float(diffs.std(ddof=1)) if len(diffs) > 1 else float("nan")
@@ -222,28 +272,50 @@ def _effect(diffs: np.ndarray, seeds: Sequence[int]) -> Dict[str, object]:
         "per_seed": {str(s): float(d) for s, d in zip(seeds, diffs)},
         "mean": float(diffs.mean()) if len(diffs) else float("nan"),
         "sd": sd,
+        "scale": EFFECT_SCALE.get(name, "unspecified"),
+        "role": "confirmatory" if confirmatory else "exploratory",
         "ci95_bootstrap": [lo, hi],
-        "ci_excludes_zero": bool(len(diffs) > 1 and (lo > 0 or hi < 0)),
-        "all_seeds_same_sign": same_sign,
-        "permutation_p": _sign_flip_p(diffs),
+        "p_one_sided_prereg": _sign_flip_p_one_sided(diffs),
+        "p_two_sided_exploratory": _sign_flip_p(diffs),
         "cohen_dz": cohen_dz,
+        # D0#14：下面两项是同一条判据（同号 ⟹ CI 排零），假阳性率≈2/2^n = permutation p 下限。
+        # 仅作诊断留存，**不得**作为判定门。
+        "legacy_diagnostic_only": {
+            "ci_excludes_zero": bool(len(diffs) > 1 and (lo > 0 or hi < 0)),
+            "all_seeds_same_sign": same_sign,
+            "note": "D0#14：同号与 CI 排零是同一条判据，不作判定门",
+        },
         "sensitivity": _sensitivity_tests(diffs),
     }
 
 
-def analyse_metric(matrix: Dict[str, np.ndarray], seeds: Sequence[int]) -> Dict[str, object]:
-    """Seed-paired 2x2 main effects and interaction. Negative = improvement."""
+def analyse_metric(matrix: Dict[str, np.ndarray], seeds: Sequence[int],
+                   metric: str) -> Dict[str, object]:
+    """Seed-paired 2x2 contrasts (S5). Negative = improvement.
+
+    三个 estimand 直接按 seed 计算，不把两个 cell 当独立样本::
+
+        route_s       = ((R_s + RP_s) - (B_s + P_s)) / 2
+        perturb_s     = ((P_s + RP_s) - (B_s + R_s)) / 2
+        interaction_s = (RP_s - P_s) - (R_s - B_s)
+    """
     b, r, p, rp = matrix["B"], matrix["R"], matrix["P"], matrix["RP"]
-    return {
+    contrasts = {
+        "route_main_effect": ((r + rp) - (b + p)) / 2.0,
+        "perturbation_main_effect": ((p + rp) - (b + r)) / 2.0,
+        "interaction": (rp - p) - (r - b),
+    }
+    out: Dict[str, object] = {
         "cells": {
             c: {"mean": float(v.mean()), "sd": float(v.std(ddof=1)) if len(v) > 1 else float("nan"),
                 "per_seed": {str(s): float(x) for s, x in zip(seeds, v)}}
             for c, v in matrix.items()
         },
-        "route_main_effect": _effect(((r + rp) - (b + p)) / 2.0, seeds),
-        "perturbation_main_effect": _effect(((p + rp) - (b + r)) / 2.0, seeds),
-        "interaction": _effect((rp - p) - (r - b), seeds),
     }
+    for name, diffs in contrasts.items():
+        confirmatory = (metric == PRIMARY_METRIC and name in PRIMARY_EFFECTS)
+        out[name] = _effect(diffs, seeds, name, confirmatory)
+    return out
 
 
 def holm(pvalues: Dict[str, float]) -> Dict[str, float]:
@@ -256,6 +328,35 @@ def holm(pvalues: Dict[str, float]) -> Dict[str, float]:
     for key, value in pvalues.items():
         adjusted.setdefault(key, value)
     return adjusted
+
+
+def apply_external_metrics(runs: Sequence[RunRecord],
+                           metrics_dir: Path) -> Tuple[List[RunRecord], Dict[str, object]]:
+    """用 `eval_openloop.py` 产出的 JSON 覆盖 checkpoint 里的 diagnostic 指标（S4-b 口径）。
+
+    每个 run 对应 ``<metrics_dir>/<tag>.json``。所有 run 的 ``inference_contract`` 必须一致 ——
+    混口径正是提交版 Table II 作废的原因，这里直接报错而不是悄悄合并。
+    """
+    updated: List[RunRecord] = []
+    contracts: Dict[str, str] = {}
+    missing: List[str] = []
+    for run in runs:
+        path = metrics_dir / f"{run.tag}.json"
+        if not path.exists():
+            missing.append(run.tag)
+            updated.append(RunRecord(**{**run.__dict__, "ade": None, "fde": None}))
+            continue
+        blob = json.loads(path.read_text(encoding="utf-8"))
+        contracts[run.tag] = str(blob.get("inference_contract", "UNKNOWN"))
+        updated.append(RunRecord(**{**run.__dict__,
+                                    "ade": float(blob["ade"]), "fde": float(blob["fde"])}))
+    distinct = sorted(set(contracts.values()))
+    if len(distinct) > 1:
+        raise SystemExit(f"metrics JSON 混用了多种 inference contract {distinct}；禁止混口径汇总")
+    if missing:
+        logger.warning("%d 个 run 缺 metrics JSON，将按缺格处理：%s", len(missing), missing)
+    return updated, {"source": str(metrics_dir), "inference_contract": distinct[0] if distinct else None,
+                     "missing_runs": missing}
 
 
 def resolve_expectations(args: argparse.Namespace,
@@ -275,6 +376,11 @@ def resolve_expectations(args: argparse.Namespace,
                 preset = json.load(fh).get("resolved_preset", {}) or {}
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("cannot read %s: %s", summary_path, exc)
+
+    # D0#16：queue 每个作业都覆写 <stage>_summary.json，formal 阶段不得依赖它
+    if args.formal and (not args.seeds or args.epoch_budget is None):
+        raise SystemExit("--formal 模式必须显式传 --seeds 与 --epoch_budget（D0#16："
+                         f"{summary_path.name} 会被队列覆写，缺格会被静默低估）")
 
     if args.seeds:
         seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
@@ -337,45 +443,70 @@ def render(report: Dict[str, object]) -> str:
                             ("interaction", "交互项")):
             e = res[name]
             lo, hi = e["ci95_bootstrap"]
-            flag = "✅" if (e["ci_excludes_zero"] and e["all_seeds_same_sign"]) else "❌"
-            add(f"   {flag} {label:<16} {e['mean']:+.4f}  95%CI [{_fmt(lo)}, {_fmt(hi)}]"
-                f"  perm p={_fmt(e['permutation_p'], 3)}"
-                f"  同号={'是' if e['all_seeds_same_sign'] else '否'}"
-                f"  dz={_fmt(e['cohen_dz'], 2)}")
+            role = "confirmatory" if e["role"] == "confirmatory" else "exploratory"
+            p_show = (f"one-sided p={_fmt(e['p_one_sided_prereg'], 4)}" if role == "confirmatory"
+                      else f"two-sided p={_fmt(e['p_two_sided_exploratory'], 3)}")
+            add(f"   [{role[:4]}] {label:<16} {e['mean']:+.4f}  95%CI [{_fmt(lo)}, {_fmt(hi)}]"
+                f"  {p_show}  dz={_fmt(e['cohen_dz'], 2)}  尺度={e['scale']}")
 
     add("")
-    add("── Holm 校正后的 permutation p " + "─" * 42)
-    for key, value in sorted(report["holm_adjusted_p"].items()):
+    add("── Holm 校正（只覆盖 confirmatory family = 主指标的 Route/Perturbation）" + "─" * 6)
+    for key, value in sorted(report["holm_adjusted_p_primary"].items()):
         add(f"   {key:<42} {_fmt(value, 4)}")
+    add("   exploratory 项（FDE、interaction）不进 Holm family，raw two-sided p 见上。")
 
     add("")
-    add("── 判定门 D1 前判（阶段15 §6）" + "─" * 42)
+    add("── 判定门 D1（Q11 one-sided + Holm，S5 分别定 δ）" + "─" * 24)
     for line in report["gate"]:
         add("   " + line)
     add("")
+    add(f"⚠️ inference 口径：{report.get('metrics_source')}")
     add("⚠️ p>0.05 不等于「等价」。要主张等价须预注册 margin 并做 TOST/非劣检验。")
     add("⚠️ dev 阶段结果只用于定方向与冻结参数，不得进入论文任何表。")
+    add("⚠️ 旧 batch=32 未校准数字只是 D0#13 诊断证据；CP1 数字只能来自 calibrated 口径。")
     add("=" * 74)
     return "\n".join(lines)
 
 
-def gate_verdict(report: Dict[str, object]) -> List[str]:
-    """Apply the three D1 pre-check criteria from 阶段15 §6."""
+def gate_verdict(report: Dict[str, object], deltas: Dict[str, Optional[float]],
+                 alpha: float) -> List[str]:
+    """D1 判定（Q11 + S5）：Holm 后的 one-sided p ≤ α **且** 效应量达到各自的 δ_decision。
+
+    δ 未签字时不给结论 —— 看到结果再定门槛是 §12.2 明令禁止的。
+    """
     out: List[str] = []
-    for factor, label in (("route_main_effect", "route"), ("perturbation_main_effect", "perturbation")):
-        verdicts = []
-        for metric in METRICS:
-            res = report["metrics"].get(metric)
-            if not res:
-                continue
-            e = res[factor]
-            ok = e["ci_excludes_zero"] and e["all_seeds_same_sign"]
-            direction = "改善" if e["mean"] < 0 else "变差"
-            verdicts.append(f"{metric.upper()}: {'稳定' if ok else '不稳定'}/{direction}")
-        out.append(f"{label:<14} " + " | ".join(verdicts) if verdicts else f"{label}: 无数据")
-    inter = [f"{m.upper()} {report['metrics'][m]['interaction']['mean']:+.4f}"
-             for m in METRICS if m in report["metrics"]]
-    out.append("interaction    " + " | ".join(inter) + "  （显著为负须在论文中报告，不得只报主效应）")
+    res = report["metrics"].get(PRIMARY_METRIC)
+    holm_adj = report.get("holm_adjusted_p_primary", {})
+    if not res:
+        return [f"主指标 {PRIMARY_METRIC.upper()} 尚无完整 2×2 数据，无法判定"]
+
+    for factor, label, key in (("route_main_effect", "Route", "route"),
+                               ("perturbation_main_effect", "Perturbation", "perturb")):
+        e = res[factor]
+        p_adj = holm_adj.get(f"{PRIMARY_METRIC}.{factor}", float("nan"))
+        delta = deltas.get(key)
+        sig = p_adj == p_adj and p_adj <= alpha
+        if delta is None:
+            verdict = "δ_decision 未签字 ⇒ 不判定"
+        elif e["mean"] <= -abs(delta) and sig:
+            verdict = "PASS"
+        else:
+            reason = []
+            if not sig:
+                reason.append(f"Holm p={_fmt(p_adj, 4)}>α")
+            if not (e["mean"] <= -abs(delta)):
+                reason.append(f"效应 {e['mean']:+.4f} 未达 δ={-abs(delta):+.4f}")
+            verdict = "FAIL（" + "，".join(reason) + "）"
+        out.append(f"{label:<14} mean={e['mean']:+.4f}  one-sided p={_fmt(e['p_one_sided_prereg'], 4)}"
+                   f"  Holm={_fmt(p_adj, 4)}  δ={'未签' if delta is None else f'{delta:.4f}'}"
+                   f"  -> {verdict}")
+
+    inter = report["metrics"][PRIMARY_METRIC]["interaction"]
+    out.append(f"interaction    mean={inter['mean']:+.4f}（difference-in-differences 尺度，"
+               f"约主效应的 2×）two-sided p={_fmt(inter['p_two_sided_exploratory'], 3)} "
+               "—— exploratory，不共用主效应 δ，不进 confirmatory family")
+    out.append(f"FDE / 其余指标全部 exploratory；confirmatory family 只有主指标 "
+               f"{PRIMARY_METRIC.upper()} 上的 Route 与 Perturbation 两项（Q11）")
     return out
 
 
@@ -389,6 +520,17 @@ def main() -> None:
     parser.add_argument("--epoch_budget", type=int, default=None,
                         help="本阶段每个 run 的 epoch 上限，用于判定是否触发 early stopping。"
                              "不给则从 <stage>_summary.json 的 resolved_preset 读。")
+    parser.add_argument("--formal", action="store_true",
+                        help="formal 模式（D0#16）：强制显式 --seeds/--epoch_budget，"
+                             "且指标必须来自 --metrics_json_dir 的 calibrated 口径。")
+    parser.add_argument("--metrics_json_dir", type=Path, default=None,
+                        help="eval_openloop.py 产出的 <run>.json 目录；给了就用它覆盖 "
+                             "checkpoint 里的 diagnostic 指标（S4-b calibrated 口径）。")
+    parser.add_argument("--delta_route", type=float, default=None,
+                        help="δ_decision(Route)，单位与主指标相同；未签字则不判定")
+    parser.add_argument("--delta_perturb", type=float, default=None,
+                        help="δ_decision(Perturbation)；与 Route 分别定（S5）")
+    parser.add_argument("--alpha", type=float, default=0.05)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -400,8 +542,20 @@ def main() -> None:
     expected_seeds, epoch_budget, preset = resolve_expectations(args, runs)
     runs = mark_early_stopping(runs, epoch_budget)
 
+    metrics_source = "models/checkpoint_best.pt (saved-checkpoint, batch=32 未校准 diagnostic 口径)"
+    external: Dict[str, object] = {}
+    if args.metrics_json_dir:
+        runs, external = apply_external_metrics(runs, args.metrics_json_dir)
+        metrics_source = f"external: {external.get('inference_contract')} ({args.metrics_json_dir})"
+    elif args.formal:
+        raise SystemExit("--formal 模式禁止使用 checkpoint 里的未校准 batch=32 指标；"
+                         "请先用 eval_openloop.py 生成 calibrated 口径并传 --metrics_json_dir")
+
     report: Dict[str, object] = {
         "stage_dir": str(args.stage_dir),
+        "formal": bool(args.formal),
+        "metrics_source": metrics_source,
+        "external_metrics": external,
         "metric_source": "models/checkpoint_best.pt (saved-checkpoint); curve minima disabled",
         "expected_seeds": expected_seeds,
         "epoch_budget": epoch_budget,
@@ -418,7 +572,7 @@ def main() -> None:
             logger.warning("metric %s: no seed present in all four cells yet", metric)
             continue
         seeds_all = seeds
-        report["metrics"][metric] = analyse_metric(matrix, seeds)
+        report["metrics"][metric] = analyse_metric(matrix, seeds, metric)
 
     present = {(r.cell, r.seed) for r in runs if r.complete}
     report["incomplete"] = [f"{c}/seed{s}" for c in CELLS for s in expected_seeds
@@ -427,12 +581,28 @@ def main() -> None:
     report["n_expected"] = len(CELLS) * len(expected_seeds)
     report["seeds_used"] = seeds_all
 
-    pvals: Dict[str, float] = {}
+    # Q11：Holm 只覆盖 confirmatory family（主指标上的两个主效应），用 one-sided p
+    primary: Dict[str, float] = {}
+    exploratory: Dict[str, float] = {}
     for metric, res in report["metrics"].items():
         for name in ("route_main_effect", "perturbation_main_effect", "interaction"):
-            pvals[f"{metric}.{name}"] = res[name]["permutation_p"]
-    report["holm_adjusted_p"] = holm(pvals)
-    report["gate"] = gate_verdict(report)
+            key = f"{metric}.{name}"
+            if metric == PRIMARY_METRIC and name in PRIMARY_EFFECTS:
+                primary[key] = res[name]["p_one_sided_prereg"]
+            else:
+                exploratory[key] = res[name]["p_two_sided_exploratory"]
+    report["holm_adjusted_p_primary"] = holm(primary)
+    report["raw_p_exploratory_two_sided"] = exploratory
+    report["test_family"] = {
+        "confirmatory": sorted(primary),
+        "test": "one-sided exact sign-flip，预注册方向=改善（负）",
+        "multiplicity": "Holm over 2 primary hypotheses",
+        "alpha": args.alpha,
+        "note": "n=6 时 one-sided raw p 下限 1/64=0.015625，Holm 后 0.03125",
+    }
+    deltas = {"route": args.delta_route, "perturb": args.delta_perturb}
+    report["delta_decision"] = deltas
+    report["gate"] = gate_verdict(report, deltas, args.alpha)
 
     text = render(report)
     print(text)

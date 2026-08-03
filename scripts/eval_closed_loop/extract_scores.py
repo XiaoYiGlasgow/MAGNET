@@ -81,14 +81,24 @@ def summarise_tag(tag: str, parquet: Path) -> Optional[Dict[str, object]]:
 
 
 def breakdown_by_type(tag: str, parquet: Path) -> pd.DataFrame:
+    """Mean score per ``scenario_type`` for one experiment tag.
+
+    The official aggregator parquet holds **one row per scenario** plus a single
+    ``final_score`` row; it does not contain pre-aggregated per-type rows. Indexing the
+    per-scenario rows by ``scenario_type`` therefore yields a non-unique index, and the
+    later ``pd.concat(..., axis=1)`` raised
+    ``InvalidIndexError: Reindexing only valid with uniquely valued Index objects``
+    (2026-07-29). Aggregating here is what makes the index unique -- and is also what the
+    section header ("per scenario_type") claims to show in the first place.
+    """
     df = pd.read_parquet(parquet)
-    if "scenario_type" not in df.columns:
+    if "scenario_type" not in df.columns or SCORE_COLUMN not in df.columns:
         return pd.DataFrame()
-    per_type = df[df["scenario_type"] != FINAL_ROW_MARKER].copy()
-    keep = ["scenario_type", SCORE_COLUMN] + [c for c in SUB_METRICS if c in per_type.columns]
-    per_type = per_type[[c for c in keep if c in per_type.columns]]
-    per_type = per_type.rename(columns={SCORE_COLUMN: tag})
-    return per_type.set_index("scenario_type")[[tag]]
+    per_scenario = df[df["scenario_type"] != FINAL_ROW_MARKER]
+    per_scenario = per_scenario[["scenario_type", SCORE_COLUMN]].dropna(subset=[SCORE_COLUMN])
+    if per_scenario.empty:
+        return pd.DataFrame()
+    return per_scenario.groupby("scenario_type")[SCORE_COLUMN].mean().to_frame(tag)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

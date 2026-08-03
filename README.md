@@ -2,8 +2,8 @@
 
 MAGNET is research code for trajectory prediction and nuPlan planning experiments. The current
 public mainline supports graph-based scene encoding, Transformer trajectory prediction, controlled
-route-feature injection, ego-state perturbation, and a matched 2×2 ablation workflow for the
-VT-2026-04191 resubmission.
+route-feature injection, ego-state perturbation, candidate-based planning refinement, and matched
+analysis workflows for the VT-2026-04191 resubmission.
 
 This repository publishes source code and small provenance manifests only. nuPlan data, processed
 features, checkpoints, experiment outputs, and internal work records are not included.
@@ -14,9 +14,16 @@ features, checkpoints, experiment outputs, and internal work records are not inc
 - Two route modes: `none` and `three_channel`.
 - Train-only ego perturbation with deterministic seeds.
 - A controlled B/R/P/RP factorial runner for route and perturbation effects.
-- Log-disjoint train/validation/test split and independent-test utilities.
+- Log-disjoint train/validation/test split and independent-test utilities, including an option to
+  consume a shared splitter YAML for paired comparisons.
 - A per-sample GNN pooling correction that is opt-in through `--gnn_pooling_fix`.
-- Vendored snapshots of the three modified nuPlan integration files.
+- An experimental candidate-based planning layer with kinematic, collision, rule, comfort, and
+  progress terms; its identity candidate and component switches support controlled ablations.
+- Analysis utilities for paired bootstrap inference, interaction-reliance audits, scaling studies,
+  checkpoint calibration, and closed-loop readout. These are protocols and tools, not published
+  performance claims.
+- Vendored snapshots of four modified nuPlan integration files, including MAGNET and PlanTF planner
+  configuration.
 - A reconstructed closed-loop evaluation harness with provenance checks.
 
 The repository also retains danger-generation utilities and pre-v8 code for continuity. Files under
@@ -34,7 +41,7 @@ MAGNET/
 │   ├── eval_closed_loop/          # reconstructed closed-loop harness
 │   ├── preprocessing/             # feature generation and route preprocessing
 │   └── training/                  # MAGNET training, splitting, tests, and 2×2 runner
-├── src/                           # shared, planning, and danger-generation modules
+├── src/                           # shared utilities, planning layer, and danger generation
 ├── archive/                       # legacy pre-v8 source code
 ├── config.py
 └── train_diffusion_gnn_trans.py   # retained danger-generation training entrypoint
@@ -105,6 +112,17 @@ python scripts/training/split_log_disjoint3.py \
   --seed 42
 ```
 
+For a paired comparison that must reuse an externally defined log partition, use the shared YAML
+mode instead of drawing another split:
+
+```bash
+python scripts/training/split_log_disjoint.py \
+  --data_dir /path/to/features \
+  --manifest /path/to/log_manifest.json \
+  --out_dir /path/to/features_logsplit \
+  --splitter_yaml /path/to/shared_splitter.yaml
+```
+
 Train one MAGNET configuration:
 
 ```bash
@@ -144,12 +162,16 @@ The lightweight checks included in the public tree are:
 python scripts/training/tests/test_perturbation.py
 python scripts/training/tests/test_gnn_pooling.py
 python scripts/preprocessing/tests/test_route_lane_alignment.py
+python scripts/training/tests/test_splitter_yaml_split.py
+python -m pytest -q src/planning_layer/tests
+python -m pytest -q scripts/eval_closed_loop/tests
 python scripts/analysis/result_manifest.py --self_test
 python devkit_patches/sync_devkit_patches.py --check
 ```
 
-The GNN pooling test and devkit sync check require the repository to be located inside the prepared
-nuPlan workspace described above.
+Some checks skip integration cases when the corresponding external nuPlan data, PlanTF checkout, or
+prepared experiment artifacts are unavailable. The GNN pooling test and devkit sync check require
+the repository to be located inside the prepared nuPlan workspace described above.
 
 ## Closed-loop evaluation
 

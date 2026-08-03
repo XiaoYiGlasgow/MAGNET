@@ -7,3 +7,9 @@ gnn_trans_planner:
   horizon_seconds: 6.0
   sampling_time: 0.1
   adjacency_config: "default"
+  # Q46 塌陷探针（§7 硬门）：null = 关闭，行为与加入本参数之前逐字节一致。
+  # 给一个目录即逐仿真步落 JSONL（一 scenario 一个文件，文件名 = <log_name>__<token>.jsonl）。
+  # 也可用环境变量 MAGNET_COLLAPSE_PROBE_DIR 开启（run_closed_loop.sh 无通用 override 透传，
+  # 给它加 flag 会改动 harness sha 并触发规则基线重跑；env var 则两组 provenance 只差一个变量）。
+  # 🔴 正式 primary 读数**必须走关闭的那一组**；探针组作为并行的第二组跑。
+  collapse_probe_dir: null

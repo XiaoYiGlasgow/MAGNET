@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import List, Type
 
 import numpy as np
@@ -49,6 +50,69 @@ _HEADING_EPS = 1e-3  # 位移过小则沿用上一朝向（避免 atan2 抖动�
 _GNN_CONFIG = None    # GNN_Trans/config.py（按文件路径显式加载，避开 run_simulation 里 'config' 名冲突）
 
 
+class _CollapseProbe:
+    """Q46 —— **逐仿真步**记录输出头是否塌陷。默认不启用；启用时对模型输出**零影响**。
+
+    为什么要挂在 planner 里而不是事后关联
+    ------------------------------------
+    干预审计的塌陷读数在 val 3000 token 上测，官方闭环在 heldout 256 场景上跑，
+    2026-08-01 实测两者 **token 交集 0、log 交集 0** ⇒ 事后逐 token 关联**建不起来**。
+    而 §7 硬门要求「塌陷必须与闭环失效逐 token 关联后才能写进论文」。
+
+    挂进 planner 则一次闭环就同时拿到两侧，而且**比事后关联更强**：
+    闭环里的塌陷发生在 ego 已经漂移出数据分布的状态上，离线 val 特征根本表示不了那些状态。
+
+    为什么对输出零影响
+    ------------------
+    PyTorch 的 forward hook **返回 None 时不修改模块输出**；本类的 hook 只做
+    `detach()` + 统计，不参与梯度也不改张量。单测 `test_collapse_probe.py` 判据 A
+    对同一批输入逐位比对「开/关探针」的轨迹，要求 `max|Δ| == 0`。
+
+    :param out_path: JSONL 落盘路径。每步一行，含 `iteration` / `collapsed` / `zero_frac`。
+    """
+
+    def __init__(self, out_path: Path) -> None:
+        self.path = out_path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 🔴 截断而不是追加：一个 scenario 一个 planner 实例、一个文件。
+        #   若用 "a"，重跑同一个 group 会**静默累积** —— `n_steps` 翻倍、
+        #   `first_collapse_step` 取到上一轮的值，而文件看上去完全正常。
+        #   截断使重跑幂等；覆盖时留一条 warning，免得无声丢掉上一轮数据。
+        if self.path.exists():
+            logger.warning("[CollapseProbe] 覆盖已存在的探针文件（重跑）: %s", self.path)
+        self._fh = open(self.path, "w", encoding="utf-8")
+        self._last: "dict | None" = None
+        self._handle = None
+
+    def attach(self, model) -> None:
+        """挂到 `output_head` 的**最后一个 ReLU** 上（与离线审计探针同一挂点）。
+
+        该 ReLU 恒零 ⇒ 末层 `Linear(128,120)` 输入是零向量、输出退化为**纯 bias**
+        ⇒ 该步预测与 ego / context / GNN 三条分支的输入全部无关。
+        挂不上就 raise —— 探针是显式要求的，静默失效等于伪造证据。
+        """
+        head = getattr(model, "output_head", None)
+        relus = [m for m in head if isinstance(m, torch.nn.ReLU)] if head is not None else []
+        if not relus:
+            raise RuntimeError("[CollapseProbe] output_head 里找不到 ReLU，探针无法挂载")
+        self._handle = relus[-1].register_forward_hook(self._capture)
+
+    def _capture(self, _module, _inp, out) -> None:
+        o = out.detach()
+        self._last = {
+            "collapsed": bool(float(o.abs().max()) == 0.0),
+            "zero_frac": round(float((o == 0).float().mean()), 6),
+        }
+
+    def record(self, scenario_id: dict, iteration: int) -> None:
+        """把本步的读数落盘。未捕获到激活时也要写一行，**不允许静默丢步**。"""
+        row = {"iteration": iteration, **scenario_id}
+        row.update(self._last if self._last is not None else {"collapsed": None, "zero_frac": None})
+        self._fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._fh.flush()
+        self._last = None
+
+
 def _load_gnn_config():
     """按文件路径显式加载 GNN_Trans/config.py（E0 契约常量单一源）。
 
@@ -67,6 +131,13 @@ def _load_gnn_config():
 class GNNTransPlanner(AbstractPlanner):
     """基于 MAGNET TransformerPredictor 的 imitation planner（路线B，官方闭环评测）。"""
 
+    #: 让 `build_planners` 注入 `scenario`（官方机制，`LogFuturePlanner` 同款）。
+    #: 只取 token / log_name / scenario_type 三个字符串给塌陷探针做 join key，
+    #: **不持有 scenario 对象本身**（避免 planner 被序列化时拖着整个场景）。
+    #: ⚠️ 唯一受影响的其他调用点是 `nuplan/submission/challenge_servicers.py:98`
+    #: （它传 scenario=None），那条路径本项目从不使用。
+    requires_scenario: bool = True
+
     def __init__(
         self,
         checkpoint_path: str,
@@ -76,13 +147,59 @@ class GNNTransPlanner(AbstractPlanner):
         adjacency_config: str = "default",
         route_mode: str = "none",
         strict_route_mode: bool = True,
+        gnn_pooling_fix: bool = False,
+        collapse_probe_dir: "str | None" = None,
+        planning_layer: "str | None" = None,
+        reference_source: "str | None" = None,
+        scenario=None,
         **kwargs,
     ) -> None:
         super().__init__()
+        # ── C4（R4-1 规划形式化）：推理侧规划层。**默认关闭**，关闭时本 planner 的输出
+        #    与加入这两个参数之前**逐位一致**（单测判据 [L]）。
+        #    两种开法，yaml 参数优先；都没给就读环境变量，再没有就是关闭：
+        #      ① `planner.gnn_trans_planner.planning_layer=full|no_progress|...`
+        #      ② 环境变量 `MAGNET_PLANNING_LAYER=<preset>`
+        #    走环境变量的理由同 Q46 探针（见 `collapse_probe_dir` 的注释）：不改
+        #    `run_closed_loop.sh` ⇒ harness sha 不变 ⇒ 不触发规则基线四格重跑。
+        from src.planning_layer import config as _pl_config  # noqa: E402
+
+        self._planning_layer_cfg = (
+            _pl_config.preset(planning_layer) if planning_layer else _pl_config.preset_from_env()
+        )
+        # 上游来源：`model`（默认，MAGNET）/ `cv`（常速外推）。
+        # 🔴 `cv` 是 C4 的**诚实性支点**（设计文档 §4.1）：若「CV+层」≈「MAGNET+层」，
+        #    结论只能写「在该规划形式化下学习组件无可测量的额外贡献」。
+        self._reference_source = (
+            reference_source or os.environ.get("MAGNET_REFERENCE_SOURCE") or "model"
+        ).strip()
+        if self._reference_source not in ("model", "cv"):
+            raise ValueError(
+                f"[GNNTransPlanner] 非法 reference_source={self._reference_source!r}，只允许 model/cv"
+            )
+        self._drivable = None          # 懒建：只有开了规划层才碰地图
+        self._route_centerline = None
+        # Q46 塌陷探针：默认关闭，行为与加入本参数之前**逐字节一致**。
+        # 两种开法，yaml 参数优先；都没给就是关闭：
+        #   ① `planner.gnn_trans_planner.collapse_probe_dir=<dir>`（hydra override）
+        #   ② 环境变量 `MAGNET_COLLAPSE_PROBE_DIR=<dir>`
+        # 🔴 为什么要留②：`run_closed_loop.sh` 没有通用 override 透传，而给它加一个 `--collapse-probe`
+        #    会改动 harness ⇒ 按既定规矩要重跑规则基线四格、且 provenance 里的 harness sha 会分叉。
+        #    走环境变量则**探针组与 primary 组的 provenance 只差一个 env var**，比两个 harness 版本更干净。
+        self._collapse_probe_dir = collapse_probe_dir or os.environ.get("MAGNET_COLLAPSE_PROBE_DIR") or None
+        self._probe: "_CollapseProbe | None" = None
+        self._scenario_id = {
+            "token": getattr(scenario, "token", None),
+            "log_name": getattr(scenario, "log_name", None),
+            "scenario_type": getattr(scenario, "scenario_type", None),
+        }
         if route_mode not in ("none", "three_channel"):
             raise ValueError(f"[GNNTransPlanner] 非法 route_mode={route_mode!r}，只允许 none/three_channel")
         self._route_mode = route_mode
         self._strict_route_mode = strict_route_mode
+        # D0#7：与训练侧同名 flag。batch=1 时 pooling ON≡OFF（global_mean_pool 单图 ≡ mean(0)），
+        # 故对 planner 部署函数无影响；保留该参数是为了 fix=True 训练的 ckpt 能对齐加载路径。
+        self._gnn_pooling_fix = bool(gnn_pooling_fix)
         self._checkpoint_path = checkpoint_path
         self._device = torch.device(device if torch.cuda.is_available() else "cpu")
         self._horizon_seconds = horizon_seconds
@@ -100,10 +217,22 @@ class GNNTransPlanner(AbstractPlanner):
         self._route_roadblock_ids: List[str] = []  # 由 initialize 注入（D1-2 route 契约）
         self._diag_logged = False  # 首个 planner 调用打印一次 history 帧数（契约核对）
         logger.info(
-            "[GNNTransPlanner] device=%s horizon=%.1fs dt=%.2fs points=%d adjacency=%s route_mode=%s",
+            "[GNNTransPlanner] device=%s horizon=%.1fs dt=%.2fs points=%d adjacency=%s route_mode=%s "
+            "planning_layer=%s reference_source=%s",
             self._device, horizon_seconds, sampling_time, self._num_output_points,
             adjacency_config, route_mode,
+            self._planning_layer_cfg.provenance(), self._reference_source,
         )
+        if self._planning_layer_cfg.enabled or self._reference_source != "model":
+            # 规划层 / CV 上游的时间栅格必须与 planner 完全一致，否则候选与输出点位错开一步。
+            # 不静默对齐 —— 失配即 raise（D0 无回退原则）。
+            if (self._planning_layer_cfg.horizon != self._num_output_points
+                    or abs(self._planning_layer_cfg.dt - sampling_time) > 1e-9):
+                raise ValueError(
+                    f"[GNNTransPlanner] 规划层时间栅格失配："
+                    f"层 horizon={self._planning_layer_cfg.horizon} dt={self._planning_layer_cfg.dt}，"
+                    f"planner points={self._num_output_points} dt={sampling_time}"
+                )
 
     # ---- checkpoint 与 route_mode 一致性（旧 ckpt 从未见过 route 通道，喂进去会失配）----
     def _check_route_mode_consistency(self) -> None:
@@ -139,21 +268,74 @@ class GNNTransPlanner(AbstractPlanner):
         else:
             logger.info("[GNNTransPlanner] route_mode 一致性校验通过: %s", ckpt_mode)
 
+        self._check_adjacency_consistency(meta_path)
+
+    def _check_adjacency_consistency(self, meta_path: str) -> None:
+        """比对 checkpoint 训练时的 `dataset_config` 与 planner 的 `adjacency_config`。
+
+        🔴 为什么必须查（2026-08-01 C3 起跑前发现）：C2 的三格用 `--dataset_config nearby_only`
+        训练，而本 planner 的 `adjacency_config` 默认是 `"default"`（完全图），
+        且此前**没有任何校验** ⇒ 会静默地拿完全图喂给只见过 30 m 近邻图的模型。
+
+        对 C2 尤其致命：C2 的靶点正是「完全图上 GCN 一层即过平滑」，
+        用完全图部署等于把要验证的修复在部署侧原样撤销 —— 闭环读数会变成无意义的负结果。
+
+        与 route_mode 同样受 `strict_route_mode` 控制（同一个「部署契约」开关）。
+        老 checkpoint 的 sidecar 里若无 `dataset_config`，按 `"default"` 处理（那正是它们的训练配置）。
+        """
+        ckpt_cfg = None
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, encoding="utf-8") as f:
+                    ckpt_cfg = json.load(f).get("dataset_config")
+            except (OSError, ValueError) as e:
+                logger.warning("[GNNTransPlanner] 读取 %s 失败: %s", meta_path, e)
+        if ckpt_cfg is None:
+            ckpt_cfg = "default"
+            logger.warning("[GNNTransPlanner] checkpoint sidecar 无 dataset_config，按 'default' 处理")
+        if ckpt_cfg != self._adjacency_config:
+            msg = (f"[GNNTransPlanner] 图拓扑失配：checkpoint 训练用 dataset_config='{ckpt_cfg}'，"
+                   f"planner 配置 adjacency_config='{self._adjacency_config}'。"
+                   f"覆盖方式：planner.gnn_trans_planner.adjacency_config={ckpt_cfg}"
+                   f"（如确需如此，设 strict_route_mode=False 降级为 warning）")
+            if self._strict_route_mode:
+                raise ValueError(msg)
+            logger.warning(msg)
+        else:
+            logger.info("[GNNTransPlanner] 图拓扑一致性校验通过: %s", ckpt_cfg)
+
     # ---- 模型加载（无回退：失败即 raise）----
     def _load_model(self) -> None:
         if self._model is not None:
             return
-        from transformer_predictor import TransformerPredictor  # parent models/（E0 生效副本）
-
-        model = TransformerPredictor().to(self._device)
         if not os.path.exists(self._checkpoint_path):
             raise FileNotFoundError(f"[GNNTransPlanner] checkpoint 不存在: {self._checkpoint_path}")
-        state_dict = torch.load(self._checkpoint_path, map_location=self._device)  # E1 bare state_dict
-        model.load_state_dict(state_dict)
-        model.eval()
+
+        # G13′-A / S4-b：走 bn_calibration 的统一加载入口，原始 ckpt 与 calibrated ckpt 都能加载。
+        # calibrated 权重比原始多 ego_history_encoder.1.running_{mean,var}/num_batches_tracked 三个键，
+        # 该入口据此自动决定是否先换 BN 再 load；旧的 bare state_dict 路径行为不变（无这三个键即原样加载）。
+        # ⚠️ 不静默兜底：加载失败一律 raise（D0 无回退原则）。
+        from src.shared.utils.bn_calibration import load_model_for_inference  # noqa: E402
+
+        model = load_model_for_inference(
+            Path(self._checkpoint_path),
+            gnn_pooling_fix=self._gnn_pooling_fix,
+            device=self._device,
+        )
         self._model = model
-        logger.info("[GNNTransPlanner] 已加载 checkpoint: %s", self._checkpoint_path)
+        bn = model.ego_history_encoder[1]
+        logger.info("[GNNTransPlanner] 已加载 checkpoint: %s (calibrated=%s, gnn_pooling_fix=%s)",
+                    self._checkpoint_path,
+                    bool(getattr(bn, "track_running_stats", False)), self._gnn_pooling_fix)
         self._check_route_mode_consistency()
+
+        # Q46：探针只在显式给了目录时挂载；一个 scenario 一个 JSONL，文件名即 join key
+        if self._collapse_probe_dir:
+            tok = self._scenario_id.get("token") or "unknown_token"
+            log = self._scenario_id.get("log_name") or "unknown_log"
+            self._probe = _CollapseProbe(Path(self._collapse_probe_dir) / f"{log}__{tok}.jsonl")
+            self._probe.attach(model)
+            logger.info("[GNNTransPlanner] 塌陷探针已挂载 -> %s", self._probe.path)
 
     @classmethod
     def get_requirements(cls) -> List[Type[Observation]]:
@@ -182,7 +364,10 @@ class GNNTransPlanner(AbstractPlanner):
         batch = Batch.from_data_list([graph_data]).to(self._device)  # data.batch=zeros(N)，batch_size=1
         with torch.no_grad():
             output = self._model(batch)  # [1, 120] = 60×2 局部增量
-        return self._output_to_trajectory(output, current_input.history.ego_states[-1])
+        # Q46：落盘发生在前向**之后**、轨迹构建之前；hook 返回 None ⇒ output 未被改动
+        if self._probe is not None:
+            self._probe.record(self._scenario_id, int(current_input.iteration.index))
+        return self._output_to_trajectory(output, current_input)
 
     # ---- 在线特征构建：完全对齐 E0 训练契约 + 复用训练同一图构建 helper ----
     def _build_graph_data(self, current_input: PlannerInput):
@@ -295,10 +480,46 @@ class GNNTransPlanner(AbstractPlanner):
             arr = np.concatenate([np.zeros((n_pad, 2), dtype=np.float32), arr], axis=0)
         return torch.from_numpy(arr[-20:])
 
+    # ---- C4 规划层接线（设计文档 §8 第 2 步）----
+    def _refine_reference(self, ref_xy: np.ndarray, current_input: PlannerInput,
+                          current_state: EgoState):
+        """把上游参考轨迹交给 C4 规划层精化，返回 `(gx, gy)`。
+
+        三个上游输入分别来自：
+          * agent 占据 ← `current_input.history.observations[-1]`（`DetectionsTracks` 常速前推）
+          * 限速 / 可行驶区域 ← `self._map_api`
+          * route 中心线 ← `self._route_roadblock_ids`（**上游塌陷时的兜底几何**）
+
+        🔴 本方法只在规划层开启或上游切成 CV 时才会被调用；默认路径一行都不执行。
+        """
+        from src.planning_layer import constant_velocity_reference, refine
+        from src.planning_layer import nuplan_adapter as adapter
+
+        ego = adapter.ego_snapshot(current_state)
+        cfg = self._planning_layer_cfg
+        if self._reference_source == "cv":
+            # CV 上游：旁路模型输出，只用当前状态常速外推（层可再单独开关，故与 cfg.enabled 无关）
+            ref_xy = constant_velocity_reference(ego, cfg)
+        if not cfg.enabled:
+            return ref_xy[:, 0], ref_xy[:, 1]
+
+        if self._drivable is None:
+            self._drivable = adapter.DrivableAreaClosure(self._map_api)
+            self._route_centerline = adapter.RouteCenterline(self._map_api)
+        ctx = adapter.build_scene_context(
+            current_state, current_input.history.observations[-1], self._map_api,
+            horizon=cfg.horizon, dt=cfg.dt, drivable=self._drivable,
+            speed_limit=adapter.speed_limit_mps(self._map_api, current_state),
+        )
+        route_xy = self._route_centerline.get(self._route_roadblock_ids, (ego.x, ego.y))
+        out = refine(ref_xy, ego, ctx=ctx, cfg=cfg, route_xy=route_xy)
+        return out[:, 0], out[:, 1]
+
     # ---- 模型增量 → 全局参考轨迹（不搓运动学/不夹速度；可行性交 two_stage_controller）----
     def _output_to_trajectory(
-        self, model_output: torch.Tensor, current_state: EgoState
+        self, model_output: torch.Tensor, current_input: PlannerInput
     ) -> InterpolatedTrajectory:
+        current_state = current_input.history.ego_states[-1]
         inc = model_output.detach().cpu().numpy().reshape(-1, 2)  # [60,2] 局部逐帧增量（首帧≈[0,0]）
         local_pos = np.cumsum(inc, axis=0)                        # [60,2] 局部累计位移（X前/Y左）
 
@@ -308,6 +529,10 @@ class GNNTransPlanner(AbstractPlanner):
         # 局部→全局（预处理「全局→局部」的逆变换）
         gx = local_pos[:, 0] * cos_h - local_pos[:, 1] * sin_h + ox
         gy = local_pos[:, 0] * sin_h + local_pos[:, 1] * cos_h + oy
+
+        # ---- C4 规划层（R4-1）：默认**完全不执行**，故关闭时输出逐位不变（判据 [L]）----
+        if self._planning_layer_cfg.enabled or self._reference_source != "model":
+            gx, gy = self._refine_reference(np.stack([gx, gy], axis=1), current_input, current_state)
 
         # 训练原点=future[0]=t+0.1（increments[0]=[0,0]），故 cumsum[i] 是 t+0.1·(i+1) 相对 future[0] 的位置。
         # 在线锚定当前 ego：把 cumsum[i] 放在 t0+i·dt（cumsum[0]≈当前 ego），则首个未来点=cumsum[1]=真实约 0.9m 位移，

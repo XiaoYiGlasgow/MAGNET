@@ -6,13 +6,19 @@
     {
       "devkit_relpath": "nuplan/planning/simulation/planner/gnn_trans_planner.py",
       "vendored": "devkit_patches/files/nuplan__planning__simulation__planner__gnn_trans_planner.py",
-      "sha256": "bc5c7642da44351cfead44723d8b10a04662395bc7dbddddff766f0794c2d0c8",
+      "sha256": "1c60d0f9cbee843aeebad72dd8b42573549baaf04ea2d299f009760eb03490e2",
       "frozen": false
     },
     {
       "devkit_relpath": "nuplan/planning/script/config/simulation/planner/gnn_trans_planner.yaml",
       "vendored": "devkit_patches/files/nuplan__planning__script__config__simulation__planner__gnn_trans_planner.yaml",
-      "sha256": "1db0104d19c6014a7f2e9ac82cfcb3f2a877e99b9d4212ef0e0b56084b72e3e8",
+      "sha256": "d419f7827b49c361a7075918679cebe1afc4689d31565b35cc5e7493eb563d63",
+      "frozen": false
+    },
+    {
+      "devkit_relpath": "nuplan/planning/script/config/simulation/planner/plantf_planner.yaml",
+      "vendored": "devkit_patches/files/nuplan__planning__script__config__simulation__planner__plantf_planner.yaml",
+      "sha256": "774a36085d9dea530804120ae5b7ca0c57943cb73febc5959a41b1ed68dcad78",
       "frozen": false
     },
     {

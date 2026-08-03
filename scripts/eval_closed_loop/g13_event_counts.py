@@ -41,8 +41,15 @@ def analyse(group: Path) -> pd.DataFrame:
         if not agg_files:
             continue
         agg = pd.read_parquet(agg_files[0])
-        # 逐场景行：scenario 非空且非 "final_score" 汇总行
-        per_scene = agg[agg["scenario"].notna() & (agg["scenario"] != "final_score")]
+        # 逐场景行：只认 log_name 非空的行。
+        # 🔴 2026-07-31 修复：旧写法 `scenario.notna() & scenario != "final_score"` 会把
+        # 13 个 scenario_type 汇总行也算成场景（270 行 = 256 逐场景 + 13 汇总 + 1 final_score），
+        # 导致 G13 被记成 269 场景、零分率 86.6%（正确值 256 场景 / 88.3%）。
+        # 与 `scratchpad/g13a_readout_20260730.py` 的口径统一。
+        if "log_name" in agg.columns:
+            per_scene = agg[agg["log_name"].notna()]
+        else:
+            per_scene = agg[agg["scenario"].notna() & (agg["scenario"] != "final_score")]
 
         score_col = "score" if "score" in per_scene.columns else per_scene.columns[-1]
         scores = pd.to_numeric(per_scene[score_col], errors="coerce").dropna()

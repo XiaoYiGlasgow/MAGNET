@@ -67,8 +67,78 @@ def group_by_log(pkls: List[Path], token_to_log: Dict[str, str]) -> Tuple[Dict[s
     return groups, orphans
 
 
+def assign_logs_from_splitter(logs: List[str], splitter_yaml: Path) -> Tuple[Set[str], Set[str]]:
+    """🔴 Q64 口径：直接读 PlanTF splitter yaml 的 `log_splits`，**不自己抽样**。
+
+    第二轮 scaling ladder 的核心前提是「同 log 池、同 token、同 benchmark」。若 MAGNET 侧
+    再用 `rng.shuffle` 自划一次 val，同一级上两个模型看到的训练数据就不同，配对比较不成立。
+    ⇒ 两条管线必须消费同一份划分（与 S1 共享清单同源：谁都不许自己再抽一次）。
+
+    yaml 由 GNN_Trans 自动生成，规则 = log 名排序后下标 %10==0 进 val（确定性、无种子）。
+
+    Args:
+        logs: 本地实际存在 pkl 的 log 名（预处理产物决定）。
+        splitter_yaml: `planTF/config/splitter/gnn_scaling_L{n}.yaml` 的绝对路径。
+
+    Returns:
+        (train_logs, val_logs)，均已与本地 logs 取交集。
+
+    Raises:
+        ValueError: yaml 结构不对、train/val 有交集，或本地 log 不是 yaml 全集的子集。
+    """
+    import yaml  # 局部 import：只有走本分支才需要 PyYAML
+
+    with open(splitter_yaml, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    try:
+        splits = cfg["log_splits"]
+        y_train, y_val = set(splits["train"]), set(splits["val"])
+    except (KeyError, TypeError) as e:
+        raise ValueError(f"{splitter_yaml} 缺 log_splits.train / log_splits.val") from e
+
+    # 硬断言 1：yaml 自身 train/val 不得有交集
+    inter = y_train & y_val
+    if inter:
+        raise ValueError(f"{splitter_yaml} 的 train/val 有 {len(inter)} 个交集：{sorted(inter)[:3]}")
+
+    y_all = y_train | y_val
+    local = set(logs)
+
+    # 本地**多出**的 log 是**预期内的**：S4 预处理一次产出 L3 全量（2 292 log），
+    # 同一个 data_dir 同时服务 L1/L2/L3 三级，低级别的 splitter 自然只覆盖其中一部分。
+    # ⇒ 这里只报数，不失败；真正该防的是下面的 missing。
+    extra = local - y_all
+    if extra:
+        logger.info("本地有 %d 个 log 不在本级 splitter 里（%d 级只取 %d 个）—— "
+                    "这是嵌套阶梯的预期行为，已按 splitter 取子集",
+                    len(extra), len(y_all), len(y_all))
+
+    # 🔴 硬断言 2：**splitter 要的每一个 log 本地都必须有 pkl**。
+    #    缺 log 意味着这一级实际训练的数据比设计的少 ⇒ 两条管线不再是同一批 log
+    #    ⇒ 配对比较不成立（Q64 要防的正是这件事）。断点续跑请等预处理跑完再 split。
+    missing = y_all - local
+    if missing:
+        raise ValueError(
+            f"🔴 splitter 要的 {len(y_all)} 个 log 里有 {len(missing)} 个本地没有 pkl"
+            f"（例：{sorted(missing)[:3]}）⇒ 该级数据不完整，两条管线的 log 池会不一致。"
+            f" 请确认预处理已跑完（features_*.pkl 数达标）后再 split。"
+        )
+
+    train_logs, val_logs = y_train & local, y_val & local
+    if not val_logs:
+        raise ValueError("按 splitter 划分后 val 为空 —— 本地 pkl 覆盖不到任何 val log")
+
+    logger.info("Q64 口径：读 %s ⇒ train/val = %d/%d log（yaml 全集 %d，本地实有 %d）",
+                splitter_yaml.name, len(train_logs), len(val_logs), len(y_all), len(local))
+    return train_logs, val_logs
+
+
 def assign_logs(logs: List[str], val_ratio: float, seed: int) -> Tuple[Set[str], Set[str]]:
-    """整 log 分配到 train/val；固定 seed，保证可复现。"""
+    """整 log 分配到 train/val；固定 seed，保证可复现。
+
+    ⚠️ 第二轮 scaling ladder **不得用本函数** —— 它自己抽一次样，会与 PlanTF 侧的
+    splitter 划分不同。第二轮请走 `--splitter_yaml`（见 `assign_logs_from_splitter`，Q64）。
+    """
     if len(logs) < 2:
         raise ValueError(f"log 数={len(logs)} < 2，无法做 log-disjoint split（数据太少）")
     ordered = sorted(logs)
@@ -114,8 +184,13 @@ def materialize_split(
 
 
 def run_split(data_dir: Path, manifest_path: Path, out_dir: Path,
-              val_ratio: float, seed: int, force: bool) -> dict:
-    """完整流程：分组→分配→物化→断言无交集→写 split_manifest.json。"""
+              val_ratio: float, seed: int, force: bool,
+              splitter_yaml: Path | None = None) -> dict:
+    """完整流程：分组→分配→物化→断言无交集→写 split_manifest.json。
+
+    `splitter_yaml` 非 None 时走 Q64 口径（读 PlanTF 同一份划分），此时 `val_ratio` / `seed`
+    对划分**不起作用**，仅原样记进 summary 以便区分产物来源。
+    """
     token_to_log = load_token_to_log(manifest_path)
     pkls = list_feature_pkls(data_dir)
     logger.info("data_dir 顶层 features_*.pkl 数=%d", len(pkls))
@@ -123,7 +198,10 @@ def run_split(data_dir: Path, manifest_path: Path, out_dir: Path,
         raise FileNotFoundError(f"{data_dir} 下没有 features_*.pkl")
 
     groups, orphans = group_by_log(pkls, token_to_log)
-    train_logs, val_logs = assign_logs(list(groups.keys()), val_ratio, seed)
+    if splitter_yaml is not None:
+        train_logs, val_logs = assign_logs_from_splitter(list(groups.keys()), splitter_yaml)
+    else:
+        train_logs, val_logs = assign_logs(list(groups.keys()), val_ratio, seed)
 
     # log-disjoint 硬断言
     overlap = train_logs & val_logs
@@ -135,8 +213,11 @@ def run_split(data_dir: Path, manifest_path: Path, out_dir: Path,
     summary = {
         "data_dir": str(data_dir),
         "manifest": str(manifest_path),
-        "seed": seed,
-        "val_ratio": val_ratio,
+        # 🔴 Q64：划分来源必须能一眼看出，否则两条管线是否同源无法事后核验
+        "split_source": "splitter_yaml" if splitter_yaml is not None else "rng_shuffle",
+        "splitter_yaml": str(splitter_yaml) if splitter_yaml is not None else None,
+        "seed": seed if splitter_yaml is None else None,
+        "val_ratio": val_ratio if splitter_yaml is None else None,
         "n_logs_total": len(groups),
         "n_logs_train": len(train_logs),
         "n_logs_val": len(val_logs),
@@ -166,8 +247,13 @@ def parse_args() -> argparse.Namespace:
                    help="token→log_name manifest 路径（默认 <data_dir>/log_manifest.json）")
     p.add_argument("--out_dir", type=str, default=None,
                    help="split 输出目录（默认 <data_dir>_logsplit）")
-    p.add_argument("--val_ratio", type=float, default=0.1, help="按 log 数计的 val 比例")
-    p.add_argument("--seed", type=int, default=42, help="log 洗牌随机种子（可复现）")
+    p.add_argument("--val_ratio", type=float, default=0.1,
+                   help="按 log 数计的 val 比例（--splitter_yaml 模式下忽略）")
+    p.add_argument("--seed", type=int, default=42,
+                   help="log 洗牌随机种子（--splitter_yaml 模式下忽略）")
+    p.add_argument("--splitter_yaml", type=str, default=None,
+                   help="🔴 Q64 第二轮口径：读 PlanTF 的 planTF/config/splitter/gnn_scaling_L{n}.yaml，"
+                        "两条管线共用同一份 train/val 划分（不再自己抽样）")
     p.add_argument("--force", action="store_true", help="覆盖已存在的 train/ val/ 子目录")
     return p.parse_args()
 
@@ -179,7 +265,11 @@ def main() -> None:
     out_dir = Path(args.out_dir).resolve() if args.out_dir else data_dir.parent / f"{data_dir.name}_logsplit"
     if not manifest_path.exists():
         raise FileNotFoundError(f"manifest 不存在：{manifest_path}（预处理是否跑过 E1 版？）")
-    run_split(data_dir, manifest_path, out_dir, args.val_ratio, args.seed, args.force)
+    splitter_yaml = Path(args.splitter_yaml).resolve() if args.splitter_yaml else None
+    if splitter_yaml is not None and not splitter_yaml.exists():
+        raise FileNotFoundError(f"splitter yaml 不存在：{splitter_yaml}")
+    run_split(data_dir, manifest_path, out_dir, args.val_ratio, args.seed, args.force,
+              splitter_yaml)
 
 
 if __name__ == "__main__":

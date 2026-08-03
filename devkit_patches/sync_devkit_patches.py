@@ -54,6 +54,10 @@ DEVKIT_ROOT = GNN_ROOT.parent
 MANAGED: List[str] = [
     "nuplan/planning/simulation/planner/gnn_trans_planner.py",
     "nuplan/planning/script/config/simulation/planner/gnn_trans_planner.yaml",
+    # PlanTF 外部 baseline 的 planner 注册（gate⑤，2026-07-31）。planner 实现本身在
+    # /mnt/local/Xiao_Yi/external/planTF（上游代码，不 vendor），我方改动只有这个注册文件
+    # 与 embedding.py 的 natten try/except —— 后者在 planTF 树内，另行记录。
+    "nuplan/planning/script/config/simulation/planner/plantf_planner.yaml",
     "models/transformer_predictor.py",
 ]
 

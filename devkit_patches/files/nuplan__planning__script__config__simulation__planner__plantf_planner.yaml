@@ -1,0 +1,46 @@
+# PlanTF（jchengai/planTF, arXiv 2309.10443）外部 baseline 的 planner 注册 —— gate⑤，2026-07-31。
+#
+# 口径声明（论文必须照写，主控表 §7）：
+#   · 官方发布的三个 checkpoint 链接**全部 404**（issue #39 开 6 周作者未回）⇒ 我方复刻的是
+#     **架构与训练配置、不是发布的权重**，且**不得引用其论文 Test14 分数作为我方数字**；
+#   · `natten` 官方 wheel 源已失效、PyPI 全版本零 wheel、源码编译需 CUDA≥11（本机 nvcc 10.1）
+#     ⇒ 局部窗口注意力由 `src/models/planTF/layers/natten_compat.py` 的等价实现替代
+#     （装得上 natten 时仍优先用官方，见 embedding.py 的 try/except）。
+#
+# 依赖：`src.*` 解析到 /mnt/local/Xiao_Yi/external/planTF —— 由 run_closed_loop.sh 在
+# `--planner plantf` 分支上设置 PYTHONPATH 与 `plantf` conda env（torch 2.8.0+cu128）。
+# 其余超参逐字段抄自 planTF 官方 config/planner/planTF.yaml，未做任何改动。
+plantf_planner:
+  _target_: src.planners.imitation_planner.ImitationPlanner
+  _convert_: 'all'
+
+  replan_interval: 1
+  use_gpu: false                # 由 run_closed_loop.sh 的 --device 覆盖
+  planner_ckpt: null            # null = 随机初始化（仅接线冒烟）；自训后由 --ckpt 覆盖
+
+  planner:
+    _target_: src.models.planTF.planning_model.PlanningModel
+    _convert_: 'all'
+
+    dim: 128
+    state_channel: 6
+    polygon_channel: 6
+    history_channel: 9
+    history_steps: 21
+    future_steps: 80
+    encoder_depth: 4
+    drop_path: 0.2
+    num_heads: 8
+    num_modes: 6
+    state_dropout: 0.75
+    use_ego_history: false
+    state_attn_encoder: true
+
+    feature_builder:
+      _target_: src.feature_builders.nuplan_feature_builder.NuplanFeatureBuilder
+      _convert_: 'all'
+      radius: 100
+      history_horizon: 2
+      future_horizon: 8
+      sample_interval: 0.1
+      max_agents: 32
