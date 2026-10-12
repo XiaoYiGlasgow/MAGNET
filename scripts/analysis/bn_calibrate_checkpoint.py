@@ -59,6 +59,15 @@ def parse_args() -> argparse.Namespace:
                    help="Q13=(ii)：对 fix=True 训练的 checkpoint 必须加，与训练语义一致")
     p.add_argument("--dataset_config", default="default")
     p.add_argument("--device", default="cpu", help="CPU 即可；calibration 只前向 1600 个样本")
+    p.add_argument("--threads", type=int, default=None,
+                   help="限制 torch intra-op 线程数。🔴 **默认 None = 不限（保持既有行为）**。\n"
+                        "为什么要有这个开关（08-05 实测代价 ≈40 min）：本脚本此前从不限线程，"
+                        "torch 默认取 16、进程实际起 80 个 OS 线程；当机器上同时有别的任务时"
+                        "（当时 12 个 --threads 2 的审计进程），会严重超配并产生同步开销 —— "
+                        "同一份 calibration 历史耗时 ≈4 min，那次跑了 ≈44 min。"
+                        "第二十一条要求「进程数」和「每进程线程数」**两个都限**，本脚本此前只做了一半。\n"
+                        "🔴 **但不要顺手改默认值**：线程数会改变浮点归约顺序 ⇒ BN 统计量在 1e-7 量级会变，"
+                        "而本项目已实证 1e-6 的条件扰动可被混沌放大。要复现旧产物就别传这个参数。")
     return p.parse_args()
 
 
@@ -94,6 +103,10 @@ def load_manifest_samples(manifest: Dict[str, Any], dataset_config: str) -> List
 
 def main() -> None:
     args = parse_args()
+    if args.threads is not None:
+        torch.set_num_threads(args.threads)
+        logger.info("torch intra-op 线程限为 %d（🔴 会改变浮点归约顺序，"
+                    "与不传该参数的旧产物不保证逐位一致）", args.threads)
     manifest = json.loads(args.manifest.read_text())
 
     # 重算 manifest 哈希，防止有人改了 entries 却没改 hash
@@ -136,6 +149,17 @@ def main() -> None:
     data_list = load_manifest_samples(manifest, args.dataset_config)
     # follow_batch 必须跟**生效**的 pooling 语义走，否则 calibration 的前向与训练/部署不同路
     follow = ["gnn_x"] if build_kwargs["gnn_pooling_fix"] else None
+    if build_kwargs.get("temporal_graph"):
+        # 🔴 R1 尚未接进本脚本，且**失败方式是静默的**：
+        #   `load_manifest_samples` 不挂 `tg_x` ⇒ `TemporalPredictor._encode_temporal_gnn`
+        #   走 fail-soft 直接返回零向量；即使挂了，缺 `follow_batch=['tg_x']` 时
+        #   `tg_x_batch` 不存在 ⇒ 整批被当成同一个样本、分组数对不上、同样回退零向量。
+        #   两条路都不报错 ⇒ 会拿「GNN 分支恒为零」的模型去估 BN 统计量，
+        #   而产出的 calibrated ckpt 看上去完全正常。宁可拒跑。
+        raise CalibrationError(
+            "本脚本尚未支持 temporal_graph（R1）：需要 (1) 给 load_manifest_samples 传拓扑并挂 "
+            "AttachTemporalGraph，(2) follow_batch 补 'tg_x'。在补齐之前拒绝产出 calibrated ckpt "
+            "—— 缺任一条都会静默地把 GNN 分支算成零向量。")
     batches = collate_fixed_batches(data_list, manifest["batch_size"], follow_batch=follow)
 
     src_state = torch.load(args.ckpt, map_location="cpu")
@@ -185,6 +209,24 @@ def main() -> None:
         "env": {"python": platform.python_version(), "torch": torch.__version__},
         "firewall_note": "locked test 未参与 calibration / checkpoint selection / 阈值设定",
     }
+    # 🔴 把源 `train_meta.json` 一并落进 out_dir（2026-08-22 加）——
+    #    `read_architecture()` 只认「与 ckpt 同目录」的 sidecar，而本脚本产出的是 **bare state_dict**，
+    #    架构信息不在权重里。缺了它，`load_model_for_inference` 会退回**父类**去建模型：
+    #      * 子类（如 `MagnetHeadNorm`）会因键名错位 strict load 抛错（08-22 实测）；
+    #      * 🔴 更糟的是父类恰好键名相同时（`context_pool_mode` / `ego_query_heads` 之类
+    #        只改行为不改形状的开关），会**静默建成错的架构**而不报任何错。
+    #    此前 fr_base 三格能用，只是因为有人 08-17 手工拷了一份，不是脚本保证的。
+    meta_copied = None
+    if src_meta_path.exists():
+        dst_meta = args.out_dir / "train_meta.json"
+        dst_meta.write_text(src_meta_path.read_text(encoding="utf-8"), encoding="utf-8")
+        meta_copied = str(dst_meta)
+        logger.info("sidecar        -> %s（read_architecture 依赖它建对模型类）", dst_meta)
+    else:
+        logger.warning("🔴 源 ckpt 目录没有 train_meta.json ⇒ calibrated 产物将无法自证架构，"
+                       "回读时会退回父类。若该 ckpt 不是父类架构，读回来的模型是错的。")
+    provenance["sidecar_train_meta_copied_to"] = meta_copied
+
     out_json = args.out_dir / f"{run_name}_calibration.json"
     out_json.write_text(json.dumps(provenance, indent=2, ensure_ascii=False))
     logger.info("calibrated ckpt -> %s", out_ckpt)

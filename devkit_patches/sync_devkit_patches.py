@@ -59,6 +59,11 @@ MANAGED: List[str] = [
     # 与 embedding.py 的 natten try/except —— 后者在 planTF 树内，另行记录。
     "nuplan/planning/script/config/simulation/planner/plantf_planner.yaml",
     "models/transformer_predictor.py",
+    # R1（Q76）的模型类：在线 planner 对 TemporalPredictor 的 checkpoint 加载的就是它
+    # （`bn_calibration.build_model` 走 `from temporal_predictor import TemporalPredictor`）。
+    # 与父类同等地位却一直没有版本护栏 ⇒ 改了不会被 --check 发现、一个 commit 也还原不了在线代码。
+    # 🔴 纳管但**不** FROZEN：父类是「一字不改」，本文件是我方要持续改的 R1 实现（2026-08-06 D9）。
+    "models/temporal_predictor.py",
 ]
 
 # 「一字不改」硬约束保护的文件：--push 前若与 vendor 不一致，拒绝执行

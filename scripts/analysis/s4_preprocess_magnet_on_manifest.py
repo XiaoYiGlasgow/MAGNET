@@ -112,6 +112,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--n_shards", type=int, default=1, help="总分片数")
     parser.add_argument("--limit_logs", type=int, default=None, help="只处理前 N 个 log（试跑用）")
     parser.add_argument("--report_every", type=int, default=10, help="每处理几个 log 打一次进度")
+    parser.add_argument("--config", default="default", choices=["default", "full_retention"],
+                        help="预处理配置档。default=旧档（20/40/删静止，与历史产物同路径）；"
+                             "full_retention=新档（D1/D2/D3/D4：64/68/全量保留+label）。"
+                             "🔴 换档必须换 --out 目录（断点续跑按文件名跳过，混目录会混档）")
     args = parser.parse_args(argv)
 
     sys.path.insert(0, str(GNN))
@@ -137,9 +141,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.shard, args.n_shards, len(my_logs), n_requested, out_dir)
 
     from scripts.preprocessing.process_nuplan_to_12d import (  # noqa: E402
-        batch_process_nuplan_data, create_default_config)
+        batch_process_nuplan_data, create_default_config, create_full_retention_config)
 
-    config = create_default_config()
+    config = (create_full_retention_config() if args.config == "full_retention"
+              else create_default_config())
+    logger.info("配置档 = %s（num_agents=%s, LANE=%s, drop_static=%s）",
+                args.config, config["num_agents"], config["max_elements"]["LANE"],
+                config.get("drop_static", True))
     t0 = time.time()
     n_done = 0          # 本次真正处理的 token 数
     n_skipped = 0       # 断点续跑跳过的
@@ -174,6 +182,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     if (out_dir / f"features_{t}.pkl").exists())
     report = {
         "tier": args.tier,
+        "config": args.config,
         "shard": args.shard,
         "n_shards": args.n_shards,
         "manifest": str(manifest_path),
@@ -187,7 +196,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "elapsed_s": round(elapsed, 1),
         "finished_at": time.strftime("%F %T"),
     }
-    report_path = SHARD_REPORT_DIR / f"s4_shard_{args.shard}.json"
+    suffix = "" if args.config == "default" else f"_{args.config}"
+    report_path = SHARD_REPORT_DIR / f"s4_shard{suffix}_{args.shard}.json"
     report_path.write_text(json.dumps(report, indent=1, ensure_ascii=False))
     logger.info("分片 %d 完成：落盘 %d / 请求 %d（跳过 %d，失败 log %d），用时 %.0f s ⇒ %s",
                 args.shard, n_on_disk, n_requested, n_skipped, len(failed_logs), elapsed, report_path)

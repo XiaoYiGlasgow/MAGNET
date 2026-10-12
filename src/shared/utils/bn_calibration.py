@@ -97,7 +97,21 @@ def state_dict_sha256(state_dict: Dict[str, torch.Tensor]) -> str:
 #: `bn_calibrate_checkpoint.py` 各自维护了一份漏掉 `ego_shortcut_suppress` 的清单，
 #: 建成父类 `MagnetEgoQueryFusion`，`ego_state_emb.*` 无处安放，strict load 直接崩。
 ARCH_BUILD_KEYS = ("context_pooling", "context_pool_mode", "ego_query_fusion",
-                   "ego_query_heads", "ego_shortcut_suppress", "ego_state_dropout")
+                   "ego_query_heads", "ego_shortcut_suppress", "ego_state_dropout",
+                   "agent_aux", "temporal_graph", "multimodal", "num_modes",
+                   "gnn_operator", "head_norm",
+                   # 🆕 路线 B（Q108/Q110）：`joint_adaptive` 是**顶层分支不是旋钮**（D-e），
+                   # `learn_topology` 区分 learned / fixed-complete 两臂（两臂参数量逐位相同）。
+                   "joint_adaptive", "learn_topology", "n_mp_layers")
+
+#: sidecar 里 `architecture.class` 的取值 -> 需要置真的建类开关。
+#: 🔴 **只作为最后一档兜底**：08-04 起跑的 R1 三 seed 用的是**加本字段之前**的
+#: `train_magnet_imitation.py`（进程已把旧代码读进内存），它们写出的 sidecar 会有
+#: `"class": "TemporalPredictor"` 但**没有** `temporal_graph` 键 ⇒ 只认键就会建成父类、
+#: strict load 报 unexpected keys 而拿不到读数。认 `class` 可以把这批 ckpt 救回来。
+CLASS_TO_ARCH_FLAG = {"TemporalPredictor": "temporal_graph",
+                      "MagnetImitationMultiModal": "multimodal",
+                      "MagnetJointAdaptive": "joint_adaptive"}
 
 #: 训练侧写进 `train_meta.json["architecture"]` 的字段名（改动要与 `train_magnet_imitation.py` 同步）。
 #: 比 `ARCH_BUILD_KEYS` 多一个 `gnn_pooling_fix_effective` —— 它在消费侧要映射成
@@ -108,7 +122,11 @@ ARCH_KEYS = ("gnn_pooling_fix_effective",) + ARCH_BUILD_KEYS
 def build_model(gnn_pooling_fix: bool = False, context_pooling: bool = False,
                 context_pool_mode: str = "max", ego_query_fusion: bool = False,
                 ego_query_heads: int = 4, ego_shortcut_suppress: bool = False,
-                ego_state_dropout: float = 0.75) -> nn.Module:
+                ego_state_dropout: float = 0.75, agent_aux: bool = False,
+                temporal_graph: bool = False, multimodal: bool = False,
+                num_modes: int = 6, gnn_operator: Optional[str] = None,
+                head_norm: bool = False, joint_adaptive: bool = False,
+                learn_topology: bool = True, n_mp_layers: int = 2) -> nn.Module:
     """按架构开关重建模型。**选择顺序必须与 `train_magnet_imitation.py` 一致**，否则推理侧建错类。
 
     :param gnn_pooling_fix: True 时 GNN 分支逐图池化（`MagnetImitationPooled`），
@@ -123,7 +141,106 @@ def build_model(gnn_pooling_fix: bool = False, context_pooling: bool = False,
         否则闸④ 的 ckpt 会被建成父类、`ego_state_emb.*` 权重无处安放而 strict 加载报错。
     :param ego_state_dropout: 闸④ 的 state dropout 概率。⚠️ 与 heads 同理**无法从权重形状反推**
         （它只影响训练期采样，不改任何张量形状），推理时不生效但必须给出以保持构造签名一致。
+    :param agent_aux: 闸⑥（Q70）的 agent 预测辅助头（`MagnetAgentAux`）。
+        ⚠️ 它**直接继承 `TransformerPredictor`**，与上面几个 pooled 变体互斥
+        ⇒ 放在最前面判断；同时打开时显式报错，不按顺序静默择一。
+        它比父类多 `agent_future_head.*`，训练侧沿用 L1 recipe（其余开关全 false）。
+    :param temporal_graph: R1（Q76 重构）的逐帧场景图 + 跨帧时序 Transformer（`TemporalPredictor`）。
+        ⚠️ 它比父类多 `frame_pos_embedding.*` 与 `temporal_transformer.*`
+        ⇒ 建错类时 strict load 直接崩（有意为之）。
+        与训练侧 `train_magnet_imitation.py:417-424` 同样**与其余建类开关互斥**并显式报错，
+        不按顺序静默择一 —— R1 的唯一变量必须是「GNN 分支是否逐帧」。
+        🔴 建类只需本开关；`temporal_topology` 是**数据侧**参数（决定每帧的边），
+        不进 `build_model`，由审计/推理侧显式给出并写进自己的 provenance。
+    :param multimodal: Q77 的多模态输出头（`MagnetImitationMultiModal`）。
+        它比父类多 `traj_head.*` / `mode_head.*`，且**父类的 `output_head` 在它里面是死参数**
+        ⇒ 塌陷探针必须改挂 `active_head()`，否则 hook 永不触发、`collapsed` 恒为 None
+        （「非塌陷子集」是 §8 使用度主口径的组成部分，静默失效会污染主判据）。
+        与其余建类开关互斥，理由同训练侧：与对照格的唯一差别必须只是输出头。
+    :param head_norm: 修 A（Q105）输出头前置 LayerNorm（`MagnetHeadNorm`）。
+        ⚠️ 它继承 `MagnetImitationPooled`（训练侧 `--head_norm` 隐含 pooling_fix），
+        比基线多 `output_head.5.{weight,bias}` 且末层下标 6→7
+        ⇒ 建错类时 strict load 直接崩（有意，与 gnn_operator/agent_aux 同构）。
+        判断顺序与 `train_magnet_imitation.py` 一致：**head_norm 先于 gnn_operator**。
+    :param num_modes: 候选轨迹数 K。⚠️ 它决定 `traj_head` 末层 `out_features = K*120`
+        ⇒ 给错时 `load_state_dict(strict=True)` 会报形状不符（响亮失败，这是有意的）。
+    :param joint_adaptive: 🆕 路线 B（Q108/Q110）的联合多智能体多模态模型 `MagnetJointAdaptive`。
+        🔴 **它是顶层分支不是旋钮**（决策 D-e）：不继承 `TransformerPredictor` 家族，
+        三条旧分支（ego / context / gnn）在它里面被**合并**成一套 per-entity token，
+        旧旋钮在新结构里**没有对应物** ⇒ 与任何其它建类开关同时为真时**显式拦截**，判断放最前面。
+        ⚠️ 它按 P4 把 ego 编码器的 `BatchNorm1d` 换成了 `LayerNorm`
+        ⇒ **BN calibration 对它不适用也不需要**（batch 依赖的唯一来源已消失）；
+        `swap_bn_with_running_stats` 会因为找不到 `ego_history_encoder` 而响亮报错，这是**预期行为**。
+    :param learn_topology: False = 固定/完全图对照臂（`w ≡ 1`）。
+        🔴 scorer 仍被实例化 ⇒ 两臂参数量**逐位相同**（Q110 §4-1 要求同容量对照）。
+    :param n_mp_layers: relation-aware message passing 层数（Q110 §3.3 定 2）。
     """
+    if joint_adaptive:
+        # 🔴 D-e：路线 B 的顶层分支。旧旋钮在新结构里没有对应物 ⇒ 任何组合都拦截，不猜。
+        others = {"gnn_pooling_fix": gnn_pooling_fix, "context_pooling": context_pooling,
+                  "ego_query_fusion": ego_query_fusion,
+                  "ego_shortcut_suppress": ego_shortcut_suppress, "agent_aux": agent_aux,
+                  "temporal_graph": temporal_graph, "multimodal": multimodal,
+                  "gnn_operator": gnn_operator, "head_norm": head_norm}
+        on = [k for k, v in others.items() if v]
+        if on:
+            raise CalibrationError(
+                f"joint_adaptive 与 {on} 同时为真 —— 路线 B 的新结构把 ego/context/gnn 三条分支"
+                f"合并成一套 per-entity token，这些旧旋钮在它里面**没有对应物**（Q110 决策 D-e）。"
+                f"sidecar 出现这种组合说明 provenance 写错了，此处拒绝猜。")
+        from magnet_joint_adaptive import MagnetJointAdaptive  # noqa: WPS433
+        return MagnetJointAdaptive(num_modes=num_modes, n_mp_layers=n_mp_layers,
+                                   learn_topology=learn_topology)
+    if multimodal:
+        others = {"gnn_pooling_fix": gnn_pooling_fix, "context_pooling": context_pooling,
+                  "ego_query_fusion": ego_query_fusion,
+                  "ego_shortcut_suppress": ego_shortcut_suppress, "agent_aux": agent_aux,
+                  "temporal_graph": temporal_graph, "gnn_operator": gnn_operator,
+                  "head_norm": head_norm}
+        on = [k for k, v in others.items() if v]
+        if on:
+            raise CalibrationError(
+                f"multimodal 与 {on} 同时为真 —— 本格的唯一变量必须是输出头，"
+                f"训练侧同样拒绝这种组合。sidecar 出现它说明 provenance 写错了，此处拒绝猜。")
+        from magnet_multimodal import MagnetImitationMultiModal  # noqa: WPS433
+        return MagnetImitationMultiModal(num_modes=num_modes)
+    if temporal_graph:
+        others = {"gnn_pooling_fix": gnn_pooling_fix, "context_pooling": context_pooling,
+                  "ego_query_fusion": ego_query_fusion,
+                  "ego_shortcut_suppress": ego_shortcut_suppress, "agent_aux": agent_aux,
+                  "gnn_operator": gnn_operator, "head_norm": head_norm}
+        on = [k for k, v in others.items() if v]
+        if on:
+            raise CalibrationError(
+                f"temporal_graph 与 {on} 同时为真 —— R1 的 recipe 是纯 L1（其余开关全 false），"
+                f"训练侧同样拒绝这种组合。sidecar 出现它说明 provenance 写错了，此处拒绝猜。")
+        from temporal_predictor import TemporalPredictor  # noqa: WPS433
+        return TemporalPredictor()
+    if agent_aux:
+        others = {"gnn_pooling_fix": gnn_pooling_fix, "context_pooling": context_pooling,
+                  "ego_query_fusion": ego_query_fusion,
+                  "ego_shortcut_suppress": ego_shortcut_suppress,
+                  "gnn_operator": gnn_operator, "head_norm": head_norm}
+        on = [k for k, v in others.items() if v]
+        if on:
+            raise CalibrationError(
+                f"agent_aux 与 {on} 同时为真 —— 闸⑥ 的 recipe 是纯 L1（其余开关全 false）。"
+                f"sidecar 出现这种组合说明训练侧写错了 provenance，此处拒绝猜。")
+        from magnet_agent_aux import MagnetAgentAux  # noqa: WPS433
+        return MagnetAgentAux(agent_aux=True)
+    if head_norm:
+        # 修 A（Q105）：输出头前置 LayerNorm。训练侧 `--head_norm` 隐含 pooling_fix
+        # （子类继承 MagnetImitationPooled），判断顺序与训练侧一致：head_norm 先于 gnn_operator。
+        others = {"context_pooling": context_pooling, "ego_query_fusion": ego_query_fusion,
+                  "ego_shortcut_suppress": ego_shortcut_suppress, "agent_aux": agent_aux,
+                  "temporal_graph": temporal_graph, "gnn_operator": gnn_operator}
+        on = [k for k, v in others.items() if v]
+        if on:
+            raise CalibrationError(
+                f"head_norm 与 {on} 同时为真 —— 修 A 的唯一变量必须只是输出头的归一化，"
+                f"训练侧同样拒绝这种组合。sidecar 出现它说明 provenance 写错了，此处拒绝猜。")
+        from magnet_head_norm import MagnetHeadNorm  # noqa: WPS433
+        return MagnetHeadNorm()
     if ego_shortcut_suppress:
         from magnet_ego_shortcut import MagnetEgoShortcutSuppressed  # noqa: WPS433
         return MagnetEgoShortcutSuppressed(context_pooling=context_pooling,
@@ -141,6 +258,12 @@ def build_model(gnn_pooling_fix: bool = False, context_pooling: bool = False,
     if context_pooling:
         from magnet_context_pooled import MagnetContextPooled  # noqa: WPS433
         return MagnetContextPooled(context_pooling=True, context_pool_mode=context_pool_mode)
+    if gnn_operator:
+        # 旋钮 B（D5）：gnn_encoder.* 键名与父类不同 ⇒ 建错类时 strict load 崩（有意）。
+        # 训练侧 `--gnn_operator` 隐含 pooling_fix（子类继承 MagnetImitationPooled），
+        # 判断顺序与 train_magnet_imitation.py 一致：gnn_operator 先于 gnn_pooling_fix。
+        from magnet_gnn_operator import MagnetGNNOperator  # noqa: WPS433
+        return MagnetGNNOperator(operator=gnn_operator)
     if gnn_pooling_fix:
         from magnet_imitation_pooled import MagnetImitationPooled  # noqa: WPS433 局部导入避免无谓依赖
         return MagnetImitationPooled()
@@ -259,10 +382,14 @@ def load_model_for_inference(ckpt_path: Path, gnn_pooling_fix: bool = False,
 
     1. 调用方显式传入的 `arch_overrides`（最高优先）；
     2. checkpoint 同目录 `train_meta.json` 的 `architecture` 块；
+    2b. 该块里的 `class` 名（**仅当对应的建类开关整个缺失时**，见 `CLASS_TO_ARCH_FLAG`）；
     3. 都没有 ⇒ 退回 `gnn_pooling_fix` 参数描述的老两态。
 
     第 3 档对老 checkpoint 是正确的（它们本来就只有两态）；对 C2 这类新架构，
     缺 sidecar 时 `load_state_dict(strict=True)` 会**直接抛错**而不是静默建错模型 —— 这是有意的。
+
+    第 2b 档是为 R1 补的向后兼容：**开关键缺失**（旧训练脚本没写）与**开关键为 false**
+    是两回事，只在前者才回退到 `class`，否则会把「显式关掉」覆盖成「打开」。
 
     :returns: 已 `eval()` 的模型。
     """
@@ -278,6 +405,12 @@ def load_model_for_inference(ckpt_path: Path, gnn_pooling_fix: bool = False,
         for k in ARCH_BUILD_KEYS:
             if k in sidecar:
                 kwargs[k] = sidecar[k]
+        flag = CLASS_TO_ARCH_FLAG.get(sidecar.get("class"))
+        if flag is not None and flag not in sidecar:
+            kwargs[flag] = True
+            logger.warning(
+                "sidecar 缺 %r 键，按 class=%r 兜底置真（训练脚本加该字段之前跑出来的 ckpt）",
+                flag, sidecar.get("class"))
         logger.info("架构取自 sidecar train_meta.json: %s", kwargs)
     kwargs.update({k: v for k, v in arch_overrides.items() if v is not None})
 

@@ -72,6 +72,14 @@ from scripts.analysis.d2_semantic_intervention import (  # noqa: E402
     split_directed_half,
     zero_nodes,
 )
+from scripts.analysis.temporal_intervention import (  # noqa: E402
+    TemporalInterventionError,
+    attach_temporal_graph,
+    num_entities,
+    remove_temporal_entities,
+    verify_entity_alignment,
+    zero_temporal_entities,
+)
 from src.shared.utils.dataset import (  # noqa: E402
     build_graph_data_from_feature_df,
     subgraph_pooling,
@@ -97,10 +105,60 @@ TARGET_TYPE, CONTROL_TYPE = "agent", "lane"
 #   ⚠️ 用包路径 import（与本文件其余 import 一致）—— 裸 `import audit_dose_contract`
 #   只在「直接执行本脚本」时有效，被 `scripts.analysis.run_interaction_audit` 方式导入
 #   （单测就是这么导的）时会 ModuleNotFoundError。
-from scripts.analysis.audit_dose_contract import DOSES, Dose, resolve_dose  # noqa: E402
+from scripts.analysis.audit_dose_contract import (  # noqa: E402
+    DOSES, RATIO_DOSES, Dose, resolve_dose,
+)
+
+#: `--doses` 的白名单 = 冻结的 primary 三个 + Q83 的剂量-反应扫描网格。
+#: 🔴 默认值仍然只有冻结的三个 —— 扫描网格必须**显式指定**才会跑，
+#: 避免有人无意中把 exploratory 的格子混进 primary family。
+_ALL_DOSES = DOSES + RATIO_DOSES
 
 #: `skip_reason` 里的量词，锁死为「节点」以逐位复现已落盘的 G19 shard。
 DOSE_UNIT = "节点"
+
+#: 🔴 与旧架构读数的可比性说明 —— 直接写进产物 provenance，判读时不必再去翻主控表。
+#: R1 的 ΔS 要与 `s4b_magnet_L1` 配对相减，先决条件是**两侧测的是同一个 estimand**。
+_COMPARABILITY_SHARED = {
+    "estimand_level": "通路级（GNN 分支），非模型级",
+    "why": "两侧的 `_clone_with` 都只覆盖 GNN 分支的输入，`data.x` 原封不动 ⇒ 被『删掉』的 "
+           "agent 其 vector-level 表示仍由 context 通路完整送达（阶段85 实测 "
+           "context_feat max|Δ| = 0.000e+00，20/20 样本）",
+    "not_comparable_with": "PlanTF 的 13.80% —— 那是把 valid_mask 整行置 False、"
+                           "agent 从**整个模型**消失（单通路），干预覆盖范围不同（§8）",
+    "dose_unit": "实体（agent/lane 各一个 subgraph），两侧逐字同义",
+    "metric": "mean_disp / base_scale，median-of-ratios，非塌陷子集（§8 主口径，不得换）",
+}
+
+_COMPARABILITY_LEGACY = {
+    **_COMPARABILITY_SHARED,
+    "architecture": "旧架构（建图前 `subgraph_pooling` 沿时间轴 np.mean，1 实体 = 1 节点）",
+    "intervened_fields": ["gnn_x", "gnn_edge_index", "gnn_edge_attr"],
+}
+
+_COMPARABILITY_TEMPORAL = {
+    **_COMPARABILITY_SHARED,
+    "architecture": "R1 逐帧场景图（1 实体 = T=19 个节点，每帧一个）+ 跨帧时序 Transformer",
+    "intervened_fields": ["tg_x", "tg_edge_index", "tg_frame"],
+    "same_as_legacy": [
+        "干预覆盖范围相同：两侧都只切 GNN 分支，context 分支两侧都完整保留",
+        "干预单位相同：删/置零的是**实体**，R1 内部展开到该实体的全部 19 帧节点",
+        "选点相同：ego 已从两侧干预池剔除（协议 §5），剂量合同与 seed 均未改",
+        "度量相同：response 与 base_scale 的定义、batch=1、horizon 均未改",
+    ],
+    "differs_from_legacy": [
+        "🔴 GNN 分支内部的图规模不同（N vs T*N 个节点）⇒ 任何按图规模归一的量不可并列，"
+        "ΔS 用的 mean_disp/base_scale 不属于此类（base_scale 是**轨迹**尺度不是图规模）",
+        "🔴 两侧是不同的 ckpt 家族，绝对使用度受各自预测尺度影响 ⇒ "
+        "只能报**配对差 ΔS**（同 token 配对、log-cluster CI），不得并列绝对值",
+        "🔴 边层面补充分析在 R1 侧不可用（打在 gnn_edge_index 上，R1 不读）⇒ 强制 --skip_edge",
+    ],
+    "known_limitation": "R1 的 GNN 分支同时引入了跨帧时序 Transformer（新增模块、随机初始化后训练）"
+                        "⇒ ΔS 度量的是「逐帧建图 + 时序聚合」这一**整包**的效应，"
+                        "不能拆成「逐帧建图单独贡献多少」（预注册判据 §1 已把 GNN 分支整体作为唯一变量）。"
+                        "另：`count_sat` 是 k = min(n_agent, n_lane)，只有 n_lane ≥ n_agent 时才等于"
+                        "「删光全部 agent」⇒ 判读一律看每条记录里实际落盘的 k_target / frac_target",
+}
 
 
 def _load_feature_df(pkl_path: Path) -> Optional[pd.DataFrame]:
@@ -113,14 +171,15 @@ def _load_feature_df(pkl_path: Path) -> Optional[pd.DataFrame]:
     return df if isinstance(df, pd.DataFrame) and len(df) > 0 else None
 
 
-def _node_types_from_df(df: pd.DataFrame) -> Optional[Tuple[List[str], np.ndarray]]:
+def _node_types_from_df(df: pd.DataFrame) -> Optional[Tuple[List[str], np.ndarray, List]]:
     """按 `gnn_x` 的行顺序还原每个 GNN 节点的归一类型，并单独给出 ego 掩码。
 
     节点顺序 = `subgraph_pooling()` 产出 dict 的键顺序 —— 与
     `build_graph_data_from_feature_df` 内部 `gnn_graph['nodes']` 的来源完全相同。
 
-    :returns: `(node_types, is_ego)`；`node_types` 里 ego 已被归一成 `'agent'`（边级分类要这样），
-        节点级干预必须再用 `is_ego` 把自车剔除（协议 §5）。
+    :returns: `(node_types, is_ego, node_order)`；`node_types` 里 ego 已被归一成 `'agent'`
+        （边级分类要这样），节点级干预必须再用 `is_ego` 把自车剔除（协议 §5）。
+        `node_order` 是这些行对应的 subgraph_ID，R1 侧用它校验与 `tg_x` 的实体顺序一致。
     """
     if "SUBGRAPH_ID_TO_NODE_INDICES" not in df.columns:
         return None
@@ -129,7 +188,8 @@ def _node_types_from_df(df: pd.DataFrame) -> Optional[Tuple[List[str], np.ndarra
     order = list(pooled.keys())
     id_to_type = df["SUBGRAPH_ID_TO_TYPE"].values[0]
     try:
-        return node_types_for_graph(id_to_type, order), ego_mask_for_graph(id_to_type, order)
+        return (node_types_for_graph(id_to_type, order),
+                ego_mask_for_graph(id_to_type, order), order)
     except InterventionError as exc:
         logger.warning("节点类型归一失败: %s", exc)
         return None
@@ -144,8 +204,14 @@ def _clone_with(data, **overrides):
 
 
 def _last_relu(model) -> Optional[torch.nn.Module]:
-    """取 `output_head` 里最后一个 ReLU（塌陷探针挂在它上面）。"""
-    head = getattr(model, "output_head", None)
+    """取**实际参与前向**的输出头里最后一个 ReLU（塌陷探针挂在它上面）。
+
+    🔴 不能写死 `output_head`：`MagnetImitationMultiModal` 走 `traj_head`，
+    父类的 `output_head` 在它里面是死参数 —— 挂上去 hook 永不触发、`collapsed` 恒为 None，
+    而「非塌陷子集」是 §8 使用度的主口径组成部分 ⇒ 主判据被静默污染。
+    ⇒ 模型自报挂点（`active_head()`），没有该方法的才回退到 `output_head`。
+    """
+    head = model.active_head() if hasattr(model, "active_head") else getattr(model, "output_head", None)
     if head is None:
         return None
     relus = [m for m in head if isinstance(m, torch.nn.ReLU)]
@@ -191,30 +257,82 @@ def _resolve_dose(dose: Dose, n_target: int, n_control: int) -> Tuple[int, int, 
 
 
 def _apply_node_ops(model, data, drop: np.ndarray,
-                    device: torch.device, horizon: Optional[int]) -> Dict[str, Dict]:
+                    device: torch.device, horizon: Optional[int],
+                    temporal: Optional[str] = None) -> Dict[str, Dict]:
     """对**同一批被选中的节点**施加 `remove` 与 `zero` 两个算子并各取一次 response。
 
     两个算子共用同一个 `drop` 集合，故两者之差只反映算子本身（实体消失 vs 实体没信息），
     不掺入「选中了不同实体」的随机性。
+
+    :param temporal: None = 旧架构（干预打在 `gnn_x`/`gnn_edge_index`）；
+        给出拓扑名（`full`/`knn30`）= R1 逐帧图（干预打在 `tg_x`/`tg_edge_index`）。
+        🔴 **两条路必须走同一个 `drop`（实体下标）**，否则两侧的 ΔS 不可配对，见
+        `temporal_intervention` 模块 docstring 的「干预单位是实体」。
     """
     out: Dict[str, Dict] = {}
+    if temporal is None:
+        out["zero"] = response(model, data,
+                               _clone_with(data, gnn_x=zero_nodes(data.gnn_x, drop)),
+                               device, horizon_steps=horizon)
+        try:
+            gnn_x, edge_index = intervene_remove_nodes(data.gnn_x, data.gnn_edge_index, drop)
+        except InterventionError as exc:
+            out["remove"] = {"skipped": str(exc)}
+            return out
+        interv = _clone_with(data, gnn_x=gnn_x, gnn_edge_index=edge_index,
+                             gnn_edge_attr=data.gnn_edge_attr.new_zeros(edge_index.shape[1]))
+        out["remove"] = response(model, data, interv, device, horizon_steps=horizon)
+        return out
+
+    n_ent = num_entities(data.tg_x)
     out["zero"] = response(model, data,
-                           _clone_with(data, gnn_x=zero_nodes(data.gnn_x, drop)),
+                           _clone_with(data, tg_x=zero_temporal_entities(data.tg_x, drop, n_ent)),
                            device, horizon_steps=horizon)
     try:
-        gnn_x, edge_index = intervene_remove_nodes(data.gnn_x, data.gnn_edge_index, drop)
-    except InterventionError as exc:
+        tg_x, tg_edge_index, tg_frame = remove_temporal_entities(
+            data.tg_x, drop, n_ent, topology=temporal)
+    except TemporalInterventionError as exc:
         out["remove"] = {"skipped": str(exc)}
         return out
-    interv = _clone_with(data, gnn_x=gnn_x, gnn_edge_index=edge_index,
-                         gnn_edge_attr=data.gnn_edge_attr.new_zeros(edge_index.shape[1]))
+    interv = _clone_with(data, tg_x=tg_x, tg_edge_index=tg_edge_index, tg_frame=tg_frame)
     out["remove"] = response(model, data, interv, device, horizon_steps=horizon)
     return out
 
 
+def _temporal_noop_disp(model, data, device: torch.device,
+                        horizon: Optional[int], topology: str) -> float:
+    """🔴 空操作校验：**走完整条干预流水线但一个实体都不删**，位移必须恰好 0.0。
+
+    与已有的 `noop_disp`（同一张图进出两次）互补 —— 那条只证明模型是确定性的，
+    本条证明**干预原语本身**（reshape → 删列 → 重算边 → 重新摊平）是恒等的。
+
+    🔴 **非 0 时直接抛错，不是记一个字段了事**：空操作非 0 说明重建路径把图改坏了，
+    而这一轮里**每一条** response 都会被同一份偏移污染 —— 产物照样写出来、看上去完全正常。
+    这正是「不报错但出假结论」那一类，必须让它停在这里。
+    判据是**严格等于 0**：空操作下重建结果与输入逐位相同（`test_temporal_intervention::test_a`
+    用 `torch.equal` 锁死），模型确定性 ⇒ 位移必然恰好 0，不存在浮点容差问题。
+
+    :raises RuntimeError: 空操作位移非 0，或两个算子都无法施加（无读数可判）。
+    """
+    empty = np.zeros(0, dtype=np.int64)
+    ops = _apply_node_ops(model, data, empty, device, horizon, temporal=topology)
+    usable = [v for v in ops.values() if "skipped" not in v]
+    if not usable:
+        raise RuntimeError(
+            f"空操作校验拿不到任何读数（两个算子都被跳过：{ops}）—— "
+            "删 0 个实体本不该失败，说明干预原语的前置条件坏了")
+    worst = max(abs(float(v["mean_disp"])) for v in usable)
+    if worst != 0.0:
+        raise RuntimeError(
+            f"🔴 空操作校验失败：不删任何实体时位移 {worst:.6e} ≠ 0 —— "
+            "逐帧图重建路径改动了图，本轮所有 response 都已被污染，拒绝继续产出读数")
+    return worst
+
+
 def _node_interventions(model, data, node_types: Sequence[str], is_ego: np.ndarray,
                         doses: Sequence[Dose], rng: np.random.Generator,
-                        device: torch.device, horizon: Optional[int]) -> Dict[str, Dict]:
+                        device: torch.device, horizon: Optional[int],
+                        temporal: Optional[str] = None) -> Dict[str, Dict]:
     """节点层面：剂量网格 × {`remove`, `zero`} × {target=agent, matched control=lane}。
 
     协议 §5：`is_ego` 为真的节点**从两侧的干预池里剔除** —— 旧实现把 ego 归一成 agent，
@@ -238,9 +356,9 @@ def _node_interventions(model, data, node_types: Sequence[str], is_ego: np.ndarr
             "frac_target": round(k_t / pool_t.size, 4),
             "frac_control": round(k_c / pool_c.size, 4),
         }
-        for op, res in _apply_node_ops(model, data, pick_t, device, horizon).items():
+        for op, res in _apply_node_ops(model, data, pick_t, device, horizon, temporal).items():
             rec[f"{op}_{TARGET_TYPE}"] = res
-        for op, res in _apply_node_ops(model, data, pick_c, device, horizon).items():
+        for op, res in _apply_node_ops(model, data, pick_c, device, horizon, temporal).items():
             rec[f"{op}_{CONTROL_TYPE}"] = res
         out[dose.name] = rec
     return out
@@ -307,8 +425,13 @@ def _rewire_data(data, edge_index: torch.Tensor):
                        gnn_edge_attr=data.gnn_edge_attr.new_zeros(edge_index.shape[1]))
 
 
-def _load_model(ckpt_path: Path, gnn_pooling_fix: bool, device: torch.device):
+def _load_model(ckpt_path: Path, gnn_pooling_fix: bool, device: torch.device,
+                temporal_graph: bool = False):
     """载入 checkpoint 并置 eval —— **必须走 S4-b 的统一入口**。
+
+    🔴 `--temporal_graph` 必须作为**显式 override** 传下去，不能只靠 sidecar：
+    `train_meta.json` 是训练**跑完**才写的，R1 训练中途落盘的 `best_model_default.pth`
+    旁边根本没有 sidecar ⇒ 只认 sidecar 会退回老两态、建成父类、strict load 崩。
 
     ⚠️ 不要自己 `TransformerPredictor()` + `load_state_dict`：默认构造的
     `ego_history_encoder` BatchNorm 是 `track_running_stats=False`，calibrated ckpt 多出来的
@@ -318,7 +441,29 @@ def _load_model(ckpt_path: Path, gnn_pooling_fix: bool, device: torch.device):
     """
     from src.shared.utils.bn_calibration import load_model_for_inference
 
-    return load_model_for_inference(ckpt_path, gnn_pooling_fix=gnn_pooling_fix, device=device)
+    # 只在开关为真时传 —— `load_model_for_inference` 用 `is not None` 过滤 override，
+    # 传 False 会把 sidecar 里的真值覆盖掉。
+    extra = {"temporal_graph": True} if temporal_graph else {}
+    return load_model_for_inference(ckpt_path, gnn_pooling_fix=gnn_pooling_fix,
+                                    device=device, **extra)
+
+
+def _check_model_matches_mode(model, temporal: Optional[str], ckpt: Path) -> None:
+    """🔴 建出来的模型类必须与 `--temporal_graph` 一致，否则干预打不中被测通路。
+
+    两个方向都会静默出错，故两个方向都拦：
+    * 忘了给 `--temporal_graph` 去审 R1 ckpt ⇒ `load_state_dict` 会先崩（strict），
+      但万一将来 sidecar 补全了别的路径，这里再拦一道；
+    * 给了 `--temporal_graph` 却指向旧架构 ckpt ⇒ 模型压根不读 `tg_x`，
+      所有 response 恒为 0，会被读成「模型不依赖交互」。
+    """
+    is_temporal_model = type(model).__name__ == "TemporalPredictor"
+    if is_temporal_model and temporal is None:
+        raise SystemExit(f"{ckpt} 建出的是 TemporalPredictor，必须加 --temporal_graph "
+                         "（否则干预打在 gnn_x 上，而该模型读的是 tg_x ⇒ response 恒 0）")
+    if not is_temporal_model and temporal is not None:
+        raise SystemExit(f"{ckpt} 建出的是 {type(model).__name__}，它不读 tg_x；"
+                         "去掉 --temporal_graph，否则所有 response 恒为 0")
 
 
 def parse_args() -> argparse.Namespace:
@@ -335,7 +480,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tokens_file", type=Path, default=None,
                    help="每行一个 token 的清单；给了它就忽略 --limit")
     p.add_argument("--doses", default=",".join(d.name for d in DOSES),
-                   help=f"逗号分隔的剂量名，取值属于 {[d.name for d in DOSES]}（协议 §3.1 冻结）")
+                   help=f"逗号分隔的剂量名。**默认只有协议 §3.1 冻结的** "
+                        f"{[d.name for d in DOSES]}；另可显式指定 Q83 剂量-反应扫描网格 "
+                        f"{[d.name for d in RATIO_DOSES]}（固定 k_target=1、k_control=R，"
+                        f"用于估计交换率 R*）。🔴 扫描网格是 exploratory，不进 primary family")
     p.add_argument("--edge_budget", type=float, default=1.0,
                    help="**仅边层面补充分析**用的预算；节点层面走 --doses，不受它影响")
     p.add_argument("--seeds", default="1000,1001,1002",
@@ -347,6 +495,11 @@ def parse_args() -> argparse.Namespace:
                    help="torch CPU 线程数；默认 8，避免与 GPU 训练的 dataloader 抢核")
     p.add_argument("--skip_edge", action="store_true",
                    help="只跑节点层面（协议 §1 已把边层面降级为补充分析，全量跑建议开）")
+    p.add_argument("--temporal_graph", action="store_true",
+                   help="R1（Q76）：被审 ckpt 是 TemporalPredictor，干预改打在 tg_x/tg_edge_index 上。"
+                        "不给这个开关去审 R1 ckpt 会加载失败（strict load 报 unexpected keys）")
+    p.add_argument("--temporal_topology", default="full", choices=["full", "knn30"],
+                   help="🔴 必须与训练时的 --temporal_topology 一致，否则审的是另一张图")
     p.add_argument("--out", required=True, type=Path)
     return p.parse_args()
 
@@ -358,10 +511,12 @@ def main() -> None:
     if a.threads > 0:
         torch.set_num_threads(a.threads)
 
-    by_name = {d.name: d for d in DOSES}
+    by_name = {d.name: d for d in _ALL_DOSES}
     unknown = [n for n in a.doses.split(",") if n.strip() and n.strip() not in by_name]
     if unknown:
-        raise SystemExit(f"未知剂量 {unknown}；协议 §3.1 冻结的取值是 {list(by_name)}")
+        raise SystemExit(f"未知剂量 {unknown}；可用取值 = 协议 §3.1 冻结的 "
+                         f"{[d.name for d in DOSES]} + Q83 扫描网格 "
+                         f"{[d.name for d in RATIO_DOSES]}")
     doses = tuple(by_name[n.strip()] for n in a.doses.split(",") if n.strip())
 
     from src.shared.utils.dataset import get_adjacency_config
@@ -377,7 +532,24 @@ def main() -> None:
     logger.info("待审计 token 数=%d，adjacency_config=%s，剂量=%s",
                 len(pkls), a.adjacency_config, [d.name for d in doses])
 
-    model = _load_model(a.ckpt, a.gnn_pooling_fix, device)
+    model = _load_model(a.ckpt, a.gnn_pooling_fix, device, temporal_graph=a.temporal_graph)
+    # 旋钮 A（判据 20260810）：建图聚合必须与被审 ckpt 的训练所见一致 —— 按 sidecar 设全局，
+    # 缺键（旧 ckpt）回退 mean = 旧行为逐位不变。产物记 subgraph_agg 供 provenance 核对。
+    from src.shared.utils.bn_calibration import read_architecture
+    from src.shared.utils.dataset import set_subgraph_agg
+    _sidecar = read_architecture(Path(a.ckpt)) or {}
+    subgraph_agg = _sidecar.get("subgraph_agg") or "mean"
+    set_subgraph_agg(subgraph_agg)
+    logger.info("建图 subgraph_agg 取自 sidecar: %s", subgraph_agg)
+    temporal = a.temporal_topology if a.temporal_graph else None
+    _check_model_matches_mode(model, temporal, a.ckpt)
+    if temporal is not None and not a.skip_edge:
+        # 边层面干预改的是 `gnn_edge_index` —— R1 的 GNN 分支不读它 ⇒ response 恒为 0，
+        # 那是「干预没打中通路」不是「模型不依赖边」。宁可拒跑也不产出会被误读的 0。
+        raise SystemExit("--temporal_graph 必须与 --skip_edge 同用："
+                         "边层面干预打在 gnn_edge_index 上，R1 的 GNN 分支读的是 tg_edge_index，"
+                         "跑出来会是恒 0 的假读数（协议 §1 已把边层面降级为补充分析）")
+
     seeds = [int(s) for s in a.seeds.split(",") if s.strip()]
 
     records: List[Dict] = []
@@ -385,6 +557,7 @@ def main() -> None:
     n_collapsed = 0
     n_no_ego = 0
     max_noop = 0.0
+    max_temporal_noop = 0.0
     t0 = time.time()
     for i, pkl in enumerate(pkls):
         token = pkl.stem.replace("features_", "")
@@ -396,7 +569,7 @@ def main() -> None:
         if parsed is None:
             skipped["no_node_types"] = skipped.get("no_node_types", 0) + 1
             continue
-        node_types, is_ego = parsed
+        node_types, is_ego, node_order = parsed
         data, reason = build_graph_data_from_feature_df(df, a.adjacency_config)
         if data is None:
             skipped[reason or "build_failed"] = skipped.get(reason or "build_failed", 0) + 1
@@ -406,6 +579,21 @@ def main() -> None:
             logger.warning("%s: gnn_x 行数 %d ≠ node_types %d，跳过（不猜对应关系）",
                            token, data.gnn_x.shape[0], len(node_types))
             continue
+        if temporal is not None:
+            # 🔴 先校验实体顺序再挂图：`drop` 是按 node_types 的下标选的，
+            #    错位的后果是「干预打到别的实体上」且全程不报错。
+            try:
+                verify_entity_alignment(data.x, node_order)
+                attach_temporal_graph(data, temporal)
+            except TemporalInterventionError as exc:
+                skipped["temporal_misaligned"] = skipped.get("temporal_misaligned", 0) + 1
+                logger.warning("%s: %s，跳过（不猜对应关系）", token, exc)
+                continue
+            if num_entities(data.tg_x) != len(node_types):
+                skipped["temporal_count_mismatch"] = skipped.get("temporal_count_mismatch", 0) + 1
+                logger.warning("%s: tg 实体数 %d ≠ node_types %d，跳过",
+                               token, num_entities(data.tg_x), len(node_types))
+                continue
         if not is_ego.any():
             n_no_ego += 1   # 识别不出 ego ⇒ 该 token 的 agent 池可能混入自车，显式计数不静默
 
@@ -416,6 +604,11 @@ def main() -> None:
         noop = response(model, data, data.clone(), device,
                         horizon_steps=a.horizon_steps)["mean_disp"]
         max_noop = max(max_noop, abs(noop))
+        temporal_noop = None
+        if temporal is not None:
+            # 🔴 更强的一条：走完整条干预流水线但一个实体都不删，位移仍须恰好 0
+            temporal_noop = _temporal_noop_disp(model, data, device, a.horizon_steps, temporal)
+            max_temporal_noop = max(max_temporal_noop, temporal_noop)
 
         for seed in seeds:
             rng = np.random.default_rng(seed)
@@ -427,8 +620,13 @@ def main() -> None:
                          "n_agent_noego": int(((np.array(node_types) == TARGET_TYPE) & ~is_ego).sum()),
                          "n_lane": int(sum(t == CONTROL_TYPE for t in node_types)),
                          "n_undirected_edges": int(data.gnn_edge_index.shape[1] // 2)}
+            if temporal is not None:
+                # 只在 R1 侧写，旧 config 复跑时逐字段与已落盘 shard 保持一致
+                rec["temporal_noop_disp"] = temporal_noop
+                rec["n_tg_rows"] = int(data.tg_x.shape[0])
+                rec["n_tg_undirected_edges"] = int(data.tg_edge_index.shape[1] // 2)
             rec["doses"] = _node_interventions(model, data, node_types, is_ego, doses,
-                                               rng, device, a.horizon_steps)
+                                               rng, device, a.horizon_steps, temporal)
             if not a.skip_edge:
                 rec["edge_supplementary"] = _edge_interventions(
                     model, data, node_types, a.edge_budget, rng, device, a.horizon_steps)
@@ -447,11 +645,17 @@ def main() -> None:
         "edge_budget": a.edge_budget, "seeds": seeds, "device": a.device,
         "horizon_steps": a.horizon_steps,
         "gnn_pooling_fix": a.gnn_pooling_fix,
+        "subgraph_agg": subgraph_agg,
         "skip_edge": a.skip_edge,
+        "temporal_graph": bool(a.temporal_graph),
+        "temporal_topology": a.temporal_topology if a.temporal_graph else None,
+        "model_class": type(model).__name__,
         "n_tokens_requested": len(pkls), "n_records": len(records),
         "n_collapsed_head": n_collapsed,
         "n_tokens_without_ego": n_no_ego,
         "max_noop_disp": max_noop,
+        "max_temporal_noop_disp": max_temporal_noop if a.temporal_graph else None,
+        "comparability": _COMPARABILITY_TEMPORAL if a.temporal_graph else _COMPARABILITY_LEGACY,
         "collapsed_head_note": "output_head 末个 ReLU 输出恒为 0 ⇒ 该场景预测退化为与全部输入无关的常数；这些 token 的 response 恒为 0.0，统计时必须与「不依赖交互」分开",
         "skipped": skipped,
         "estimand": "semantic_specificity = response(移除 k_a 个 agent) - response(移除 k_m 个 lane)；"

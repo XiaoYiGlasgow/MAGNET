@@ -265,6 +265,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--seed", type=int, default=SEED_DEFAULT)
     parser.add_argument("--allow-partial", action="store_true", help="场景不完全配对时取交集（须在读数里声明）")
     parser.add_argument("--regress", action="store_true", help="复算阶段57 已发表的四个对比")
+    parser.add_argument("--out", type=Path, default=None,
+                        help="把读数落盘成 json（默认 None = 只打印，行为与旧版逐字相同）。"
+                             "🔴 凡要被表/图/letter 引用的对比都必须落盘——控制台数字无法复核（第八十八条）")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -285,6 +288,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"\n=== 配对对比（n_boot={args.n_boot}, seed={args.seed}）===")
     print(format_result(res))
+    if args.out is not None:
+        import json
+        from dataclasses import asdict
+        payload = {
+            "script": str(Path(__file__).resolve()),
+            "group_a": str(_resolve(args.a)), "group_b": str(_resolve(args.b)),
+            "n_boot": args.n_boot, "seed": args.seed, "allow_partial": bool(args.allow_partial),
+            "caveat": "配对差有效；两格绝对水位是否可并列由各自 ckpt/数据档决定，本脚本不判断",
+            **asdict(res),
+            "ci95": [res.ci_lo, res.ci_hi],
+            "ci_excludes_zero": res.ci_excludes_zero,
+        }
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("读数已落盘：%s", args.out)
     return 0
 
 

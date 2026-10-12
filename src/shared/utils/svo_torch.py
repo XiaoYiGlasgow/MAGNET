@@ -13,7 +13,7 @@ sources are acceleration patterns (yield/aggressive) and social proximity force.
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -361,3 +361,176 @@ def svo_dps_loss(
     # loss = mean distance above target (push SVO down toward target)
     loss = F.relu(svo_batch - target_svo_deg).mean()
     return loss
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 路线 A（2026-09-16）：可微软累加 SVO —— 用户 09-13 定义的累加式时变 SVO 的软化版。
+# numpy 参照（逐项对齐）：scratchpad/svo_timevarying_20260911/svo_readout.py 的
+#   alpha_cumulative / smooth_trunc / _events / HIST_REAL_START。
+# 与上面 compute_ego_svo_torch_timevarying 的区别：
+#   - 行为量按时间累加（α(t) 由「历史初始量 + 未来第 1..t 帧累加量」求角），不是逐帧独立；
+#   - 计数前加速度做截断窗口居中滑动平均；未来第 0..seam_skip 帧事件置 0（接缝余波）；
+#   - 不含横向/social force 项（用户定义只有纵向让行/抢行两类事件）。
+# 只供 sdedit_with_full_guidance_phase2(svo_measure='soft_cumulative') 与离线读数使用，
+# 不改动上面任何既有函数。
+# ─────────────────────────────────────────────────────────────────────────────
+
+SVO_SOFT_HIST_REAL_START = 20   # _full 数据集 history 前 20 帧为零填充，只用其后的真实段（同 svo_readout.HIST_REAL_START）
+
+
+def default_svo_soft_cfg() -> Dict[str, Any]:
+    """软累加 SVO 的默认参数（每次返回新 dict，调用方可放心修改）。
+
+    必选键：
+        dth        : 让行（减速）硬阈值 m/s²，加速度 < -dth 计一次让行（同 alpha_cumulative 默认 3.0）
+        ath        : 抢行（加速）硬阈值 m/s²，加速度 > ath 计一次抢行（同 alpha_cumulative 默认 2.0）
+        sc         : sigmoid 陡度；越大越接近硬计数（1.6 = 与实测加速度量程匹配的过渡带宽）
+        acc_smooth : 计数前加速度截断窗口滑动平均窗长（帧，须为奇数；5 = 0.5 s；<=1 = 不平滑）
+        seam_skip  : 未来第 0..seam_skip 帧的事件置 0（第 0 帧本来就不计，另跳过接缝余波）
+    可选键（缺省即下列值，与 alpha_cumulative 一致）：
+        dt=0.1, d_yield=(-0.10, 0.15), d_aggr=(0.15, -0.10), x_floor=0.1,
+        hist_real_start=SVO_SOFT_HIST_REAL_START
+    """
+    return dict(dth=3.0, ath=2.0, sc=1.6, acc_smooth=5, seam_skip=4)
+
+
+def _resolve_svo_soft_cfg(cfg: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """默认参数 + 调用方覆盖（只覆盖给出的键），返回新 dict。"""
+    out = default_svo_soft_cfg()
+    out.update(dict(dt=0.1, d_yield=(-0.10, 0.15), d_aggr=(0.15, -0.10), x_floor=0.1,
+                    hist_real_start=SVO_SOFT_HIST_REAL_START))
+    if cfg is not None:
+        out.update(dict(cfg))
+    return out
+
+
+def smooth_trunc_torch(a: torch.Tensor, w: int) -> torch.Tensor:
+    """等权滑动平均（可微），边缘截断窗口：只对窗口内实际存在的帧求平均，长度不变。
+
+    逐项对齐 svo_readout.smooth_trunc：
+        np.convolve(a, ones(w), 'same') / np.convolve(ones_like(a), ones(w), 'same')
+    w 为奇数时 'same' 居中，等价于两侧各补 w//2 个 0 做求和、再除以窗口内实际帧数。
+
+    Args:
+        a: (..., L) 待平滑序列（可带梯度）。
+        w: 窗长（帧）；w<=1 时原样返回。
+
+    Returns:
+        (..., L) 平滑后序列。
+
+    Raises:
+        ValueError: w 为偶数（'same' 卷积不居中，事件整体后移半帧）或 L < w（与 numpy 版断言一致）。
+    """
+    w = int(w)
+    if w <= 1:
+        return a
+    if w % 2 != 1:
+        raise ValueError(f'smooth_trunc_torch 窗口须为奇数，得到 {w}')
+    length = a.shape[-1]
+    if length < w:
+        raise ValueError(f'序列长度 {length} 小于窗口 {w}')
+    lead_shape = a.shape[:-1]
+    flat = a.reshape(-1, 1, length)
+    kernel = a.new_ones(1, 1, w)
+    summed = F.conv1d(flat, kernel, padding=w // 2)                        # 窗口内求和（越界处补 0）
+    count = F.conv1d(a.new_ones(1, 1, length), kernel, padding=w // 2)     # 窗口内实际帧数
+    return (summed / count).reshape(*lead_shape, length)
+
+
+@torch.no_grad()
+def svo_soft_initial_counts(
+    hist: torch.Tensor,
+    cfg: Optional[Mapping[str, Any]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """历史真实段的硬阈值事件计数（初始累加量 Y0, A0），不带梯度。
+
+    逐项对齐 alpha_cumulative 的历史部分：
+        sp_h = hypot(hist[HIST_REAL_START:, 3], hist[HIST_REAL_START:, 4])
+        acc_h = smooth_trunc(diff(sp_h) / dt, acc_smooth)
+        Y0 = sum(acc_h < -dth)，A0 = sum(acc_h > ath)
+    速度与差分在 hist 自身 dtype 下算（与 numpy 对 float32 输入的行为一致），平滑与计数升到 float64。
+
+    Args:
+        hist: (T_hist, 5) 或 (B, T_hist, 5) 历史 [x, y, heading, vx, vy]。
+        cfg: 软累加参数（见 default_svo_soft_cfg），只用 dt/dth/ath/acc_smooth/hist_real_start。
+
+    Returns:
+        (Y0, A0)：形状 () 或 (B,)，float64，与 hist 同 device。
+    """
+    c = _resolve_svo_soft_cfg(cfg)
+    h = hist.detach()[..., int(c['hist_real_start']):, :]
+    sp = torch.hypot(h[..., 3], h[..., 4])                                 # (..., L_h)
+    acc = torch.diff(sp, dim=-1) / float(c['dt'])
+    acc = smooth_trunc_torch(acc.to(torch.float64), int(c['acc_smooth']))
+    y0 = (acc < -float(c['dth'])).to(torch.float64).sum(dim=-1)
+    a0 = (acc > float(c['ath'])).to(torch.float64).sum(dim=-1)
+    return y0, a0
+
+
+def compute_svo_soft_cumulative_torch(
+    dxdy: torch.Tensor,
+    hist: Optional[torch.Tensor] = None,
+    cfg: Optional[Mapping[str, Any]] = None,
+) -> torch.Tensor:
+    """可微软累加 SVO：返回逐帧 α(t)（度），对 dxdy 可导。
+
+    步骤（dt=0.1）：
+      1) speeds = ||dxdy|| / dt；acc = [0, diff(speeds)/dt]；acc[1:] 做截断窗口居中滑动平均（窗长 acc_smooth）；
+      2) 软事件 yield = sigmoid((−acc − dth)·sc)，aggr = sigmoid((acc − ath)·sc)，第 0..seam_skip 帧置 0；
+      3) 初始量 (Y0, A0)：hist 给出时按历史真实段硬阈值计数（不带梯度，见 svo_soft_initial_counts）；
+         hist=None 时为 0（agent 按用户 09-13 决定取初始 0）；
+      4) Y = Y0 + cumsum(yield)，A = A0 + cumsum(aggr)；
+         x = max(1 − 0.10·Y + 0.15·A, 0.1)，y = 0.15·Y − 0.10·A，α = degrees(atan2(y, x))。
+    sc → ∞ 时与「alpha_cumulative 结果再把 yf/af 第 0..seam_skip 帧置 0 后重算」一致。
+    x 的下限用 clamp：与 np.maximum 同值，x<0.1 处梯度为 0。
+
+    Args:
+        dxdy: (T, 2) 或 (B, T, 2) 逐步位移增量（可带梯度）。
+        hist: (T_hist, 5) 或 (B, T_hist, 5) 历史 [x, y, heading, vx, vy]（不求导），或 None（初始量 0）。
+        cfg: 软累加参数，None 或缺省键取 default_svo_soft_cfg() 的值。
+
+    Returns:
+        α(t)：(T,) 或 (B, T)，单位度，dtype/device 同 dxdy。
+    """
+    c = _resolve_svo_soft_cfg(cfg)
+    squeeze = dxdy.dim() == 2
+    d = dxdy.unsqueeze(0) if squeeze else dxdy                             # (B, T, 2)
+    n_batch, n_t = d.shape[0], d.shape[1]
+    dt = float(c['dt'])
+    sc = float(c['sc'])
+
+    # 1) 速度与加速度；第 0 帧不计接缝（置 0），acc[1:] 截断窗口平滑
+    speeds = d.norm(dim=-1) / dt                                           # (B, T)
+    acc_tail = torch.diff(speeds, dim=-1) / dt                             # (B, T-1)
+    acc_tail = smooth_trunc_torch(acc_tail, int(c['acc_smooth']))
+    acc = torch.cat([acc_tail.new_zeros(n_batch, 1), acc_tail], dim=-1)   # (B, T)
+
+    # 2) 软事件 + 跳过第 0..seam_skip 帧
+    yld = torch.sigmoid((-acc - float(c['dth'])) * sc)
+    agg = torch.sigmoid((acc - float(c['ath'])) * sc)
+    n_skip = min(max(int(c['seam_skip']), 0) + 1, n_t)
+    keep = acc.new_ones(n_t)
+    keep[:n_skip] = 0.0
+    yld = yld * keep
+    agg = agg * keep
+
+    # 3) 初始累加量（历史硬计数，无梯度）
+    if hist is None:
+        y0 = acc.new_zeros(n_batch)
+        a0 = acc.new_zeros(n_batch)
+    else:
+        if hist.dim() == 3 and hist.shape[0] != n_batch:
+            raise ValueError(f'hist batch {hist.shape[0]} 与 dxdy batch {n_batch} 不一致')
+        y0, a0 = svo_soft_initial_counts(hist, c)
+        y0 = y0.to(dtype=acc.dtype, device=acc.device).expand(n_batch)
+        a0 = a0.to(dtype=acc.dtype, device=acc.device).expand(n_batch)
+
+    # 4) 累加 → 角度
+    y_cum = y0.unsqueeze(1) + torch.cumsum(yld, dim=-1)                    # (B, T)
+    a_cum = a0.unsqueeze(1) + torch.cumsum(agg, dim=-1)
+    d_yield, d_aggr = c['d_yield'], c['d_aggr']
+    x = 1.0 + float(d_yield[0]) * y_cum + float(d_aggr[0]) * a_cum
+    y = float(d_yield[1]) * y_cum + float(d_aggr[1]) * a_cum
+    x = x.clamp(min=float(c['x_floor']))
+    alpha = torch.rad2deg(torch.atan2(y, x))
+    return alpha[0] if squeeze else alpha

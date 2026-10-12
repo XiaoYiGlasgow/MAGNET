@@ -7,9 +7,21 @@ gnn_trans_planner:
   horizon_seconds: 6.0
   sampling_time: 0.1
   adjacency_config: "default"
+  # R1（Q76）逐帧场景图的**数据侧**拓扑，决定每帧内怎么连边，必须与训练时的
+  # `--temporal_topology` 一致。null = 从 checkpoint sidecar 的 architecture.temporal_topology 取；
+  # sidecar 也没有（08-04 那批 R1 run 早于该字段）则回退 "full" 并告警。
+  # 🔴 只对 TemporalPredictor 的 checkpoint 生效；父类 checkpoint 完全不走这条路径。
+  temporal_topology: null
   # Q46 塌陷探针（§7 硬门）：null = 关闭，行为与加入本参数之前逐字节一致。
   # 给一个目录即逐仿真步落 JSONL（一 scenario 一个文件，文件名 = <log_name>__<token>.jsonl）。
   # 也可用环境变量 MAGNET_COLLAPSE_PROBE_DIR 开启（run_closed_loop.sh 无通用 override 透传，
   # 给它加 flag 会改动 harness sha 并触发规则基线重跑；env var 则两组 provenance 只差一个变量）。
   # 🔴 正式 primary 读数**必须走关闭的那一组**；探针组作为并行的第二组跑。
   collapse_probe_dir: null
+  # F 留车切边闭环接线（VT-2026-04191 预注册判据 §5，2026-08-16）。两者 null = 关闭 ⇒ 行为与加入前逐位一致。
+  #   feature_contract: default | full_retention —— 新档 fullret ckpt（experiments/knobs/*_L1/）必须 full_retention
+  #     （agents 64 / LANE 68 / 半径仍 50 / 静止车保留），planner 会对照 ckpt sidecar 校验，失配即 raise。
+  #   edge_mask: none | a2a | E | EA —— 推理期按边族切边（只删边，节点/特征不动）；配对实验 ON/OFF 只差它。
+  # 也可用环境变量 MAGNET_FEATURE_CONTRACT / MAGNET_EDGE_MASK 开启（同 collapse_probe_dir 的理由：不改 harness）。
+  feature_contract: null
+  edge_mask: null
