@@ -239,7 +239,9 @@ def process_nuplan_scenario_to_12d_features(scenario, config):
         past_timestamps,
         T_ref,
         ego_history=ego_history_local,  # [20,2] 局部增量（决策D）
-        lane_route_channels=lane_route_channels  # route 三通道 -> lane col6/col7/col8
+        lane_route_channels=lane_route_channels,  # route 三通道 -> lane col6/col7/col8
+        # D3（08-06）：config 没给这个键时恒为 True ⇒ 既有调用方逐字节不变
+        drop_static=config.get('drop_static', True)
     )
 
     # ✅ 关键修复：手动设置正确的ego绝对位置
@@ -442,7 +444,9 @@ def process_nuplan_scenario_to_12d_features_silent(scenario, config):
             past_timestamps,
             T_ref,
             ego_history=ego_history_local,  # [20,2] 局部增量（决策D）
-            lane_route_channels=lane_route_channels  # route 三通道 -> lane col6/col7/col8
+            lane_route_channels=lane_route_channels,  # route 三通道 -> lane col6/col7/col8
+            # D3（08-06）：config 没给这个键时恒为 True ⇒ 既有调用方逐字节不变
+            drop_static=config.get('drop_static', True)
         )
 
         # ✅ 关键修复：手动设置正确的ego绝对位置
@@ -561,6 +565,32 @@ def create_default_config():
         # 'three_channel'=启用 proximity/progress/is_on_route。默认 none 保持旧行为。
         'route_mode': getattr(dm_config, 'ROUTE_MODE', 'none')
     }
+
+
+def create_full_retention_config():
+    """**新档**配置（D1/D2/D3/D4，用户 2026-08-06 裁定）：全量保留 + label。
+
+    🔴 **为什么不直接改 `config.py` 的全局默认**：`config.NUM_AGENTS` / `MAX_ELEMENTS`
+    是**在线 planner 与全部既有预处理共享**的默认值。改它等于把新档偷偷施加到
+    在线部署与旧数据重跑上 —— 那既破坏「新产物 mask 成现状后逐字节相同」这道门，
+    也会让 planner 在没人察觉的情况下换了输入规模。故新档一律**显式 opt-in**。
+
+    与默认档的差异（**只有这四项**，其余逐字继承）：
+
+    ======================  ======  ======  ==========================================
+    参数                    默认档  新档    依据
+    ======================  ======  ======  ==========================================
+    ``num_agents``            20      64    D1；探针 p99=47 / max=63，且 = PlanTF 代码默认
+    ``max_elements['LANE']``  40      68    D2；探针 @50m max=68 ⇒ 50 m 内等价不截断
+    ``map_radius``          50.0    50.0    D2 明确**保持** —— 50→100 是独立变量，单开一格
+    ``drop_static``         True    False   D3；静止车照样进图 + 打 label
+    ======================  ======  ======  ==========================================
+    """
+    cfg = create_default_config()
+    cfg['num_agents'] = 64
+    cfg['max_elements'] = {**cfg['max_elements'], 'LANE': 68}
+    cfg['drop_static'] = False
+    return cfg
 
 
 def demo_process_single_scenario():

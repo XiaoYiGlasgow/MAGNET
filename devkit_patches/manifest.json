@@ -6,13 +6,13 @@
     {
       "devkit_relpath": "nuplan/planning/simulation/planner/gnn_trans_planner.py",
       "vendored": "devkit_patches/files/nuplan__planning__simulation__planner__gnn_trans_planner.py",
-      "sha256": "1c60d0f9cbee843aeebad72dd8b42573549baaf04ea2d299f009760eb03490e2",
+      "sha256": "ff032e9b9be60164288cec0c618f4b4779b26c64dfffd8732dc0ffe346212467",
       "frozen": false
     },
     {
       "devkit_relpath": "nuplan/planning/script/config/simulation/planner/gnn_trans_planner.yaml",
       "vendored": "devkit_patches/files/nuplan__planning__script__config__simulation__planner__gnn_trans_planner.yaml",
-      "sha256": "d419f7827b49c361a7075918679cebe1afc4689d31565b35cc5e7493eb563d63",
+      "sha256": "27906f0edd40776cc7c65a2258ab22339a11342d556354627f11edbd7dea00fd",
       "frozen": false
     },
     {
@@ -26,6 +26,12 @@
       "vendored": "devkit_patches/files/models__transformer_predictor.py",
       "sha256": "37c7503b961865617e8de2891d84cb8ea118bf5af3bb97d88cf44a3213f3329d",
       "frozen": true
+    },
+    {
+      "devkit_relpath": "models/temporal_predictor.py",
+      "vendored": "devkit_patches/files/models__temporal_predictor.py",
+      "sha256": "4457c5305dafca0d77a43b6943cff9b22cea9a139d9dc1c75a5d379edd3a0c2f",
+      "frozen": false
     }
   ]
 }

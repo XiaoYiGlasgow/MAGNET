@@ -784,13 +784,24 @@ def encoding_vectornet_features(
     time_stamps_past,  # ✅ 绝对时间戳数组（torch tensor，单位秒）
     T_ref,             # ✅ 参考绝对时间（float，单位秒）
     ego_history=None,        # ✅ 新增参数：ego历史轨迹数据
-    lane_route_channels=None # ★ VT-2026-04191 阶段⑫：与 vector_map['lanes'] 同序的 route 三通道
+    lane_route_channels=None,# ★ VT-2026-04191 阶段⑫：与 vector_map['lanes'] 同序的 route 三通道
+    drop_static=True         # ★ VT-2026-04191 D3（08-06）：False = 全量保留 + 打 label
 ):
     """:param lane_route_channels: 可选，形状 (≥len(vector_map['lanes']), 3) 的数组，由
     `build_route_channels` 生成，顺序与 map_process 的 coords['LANE'] 严格一致。
     三列依次写入 lane 节点的 col6/col7/col8（这三列对 lane 原为 0 占位）：
     route 邻近度 / 沿 route 归一化进度 / is_on_route。
-    传 None 时三列保持全 0，与 route 引入前的产出逐字节一致。"""
+    传 None 时三列保持全 0，与 route 引入前的产出逐字节一致。
+
+    :param drop_static: **VT-2026-04191 D3（用户 2026-08-06 裁定）**。
+        ``True``（默认）= 旧行为，`avg_speed < 0.01` 的 agent 在建图前被丢弃，
+        **产出与本参数引入前逐字节一致，且不新增任何列**（等价门靠这一点）。
+        ``False`` = 全量保留：静止车照样进图，并在**独立字段** ``SUBGRAPH_ID_TO_LABEL``
+        里给每个 agent 子图打输入侧 label（定义见 `agent_labels.py`）。
+
+        🔴 **列的变化只发生在 ``drop_static=False``**：那一档才多出
+        ``SUBGRAPH_ID_TO_LABEL`` 一列。默认档的 DataFrame 列集合一个字都不变
+        —— 否则「新产物 mask 成现状后与旧产物逐字节相同」这道门根本无从谈起。"""
     import numpy as np
 
     # ✅ 关键修复：在坐标转换之前保存ego车辆的绝对位置
@@ -848,6 +859,31 @@ def encoding_vectornet_features(
     # —— 处理其他 agents ——
 
     speed_threshold = 0.01  # 低于这个速度的 agent 被视为“静止”，单位：m/s
+    # 🔴 本行**故意保持就地硬编码**，不从 `agent_labels` 导入。
+    #    理由（08-06 自审查出）：`data_utils` 在本仓有**三条不同的导入路径**
+    #    —— `src.shared.utils.data_utils`（在线 planner）/ `GNN_Trans.utils.data_utils`（预处理，
+    #    走 `utils -> src/shared/utils` 符号链接）/ 扁平 `from data_utils import`（`data_processor.py`）。
+    #    在函数顶部加一个 `from src.shared.utils.agent_labels import ...` 会让**默认路径**
+    #    在第三种上下文里多出一个失败点，而默认路径是在线 planner 和全部既有预处理在走的。
+    #    单一真相源改由单测保证：`tests/test_agent_labels.py::test_e` 断言本值 ==
+    #    `agent_labels.SPEED_THRESHOLD`，两边任一改动都会当场红。
+
+    # D3/D4：只有全量档才需要 label；导入放在**分支内**，默认路径逐字不新增任何导入。
+    # 🔴 `drop_static=False` 同时开启 **agent 侧与 lane 侧**两套 label —— 一个开关管两件事，
+    #    因为「全量保留 + 打 label」本来就是同一个档位（§0.0-i），拆成两个 flag 会多出
+    #    两种无意义组合，还要为它们写测试。
+    agent_labels = subgraph_ID_to_label = lane_labels_list = None
+    if not drop_static:
+        from src.shared.utils.agent_labels import compute_agent_labels  # noqa: WPS433
+        from src.shared.utils.lane_labels import compute_lane_labels    # noqa: WPS433
+        # agent 侧：返回列表与 agents_past **逐位对齐**（不可用槽位为 None），
+        # 所以下面用同一个下标 i 即可取到，无需第二套映射。
+        agent_labels = compute_agent_labels(agents_past)
+        # lane 侧：与 vector_map['lanes'] 逐位对齐。
+        # ⚠️ 它的 `lane_dist_rank` 是**按距离排的名次**，不是 lanes 的原始下标
+        #    （agent 侧下标即 rank，lane 侧不是 —— 两边约定不同，混用会静默算错）。
+        lane_labels_list = compute_lane_labels(vector_map['lanes'], lane_route_channels)
+        subgraph_ID_to_label = {}
 
     for i, agent_hist in enumerate(agents_past):
         M = agent_hist.shape[0]
@@ -864,7 +900,9 @@ def encoding_vectornet_features(
         avg_speed = np.mean((speed_a[:-1] + speed_a[1:]) / 2)
 
         # 如果平均速度小于阈值，则跳过这个 agent
-        if avg_speed < speed_threshold:
+        # 🔴 D3：drop_static=False 时**不再跳过** —— 静止车照样进图，靠 label 事后 mask。
+        #    这正是「留车切边」的前提（车必须在图里），也把 29.53% 的空图率基本清零。
+        if drop_static and avg_speed < speed_threshold:
             continue
 
         agent_subgraph = np.hstack((
@@ -884,6 +922,11 @@ def encoding_vectornet_features(
         end_ID   = trajectory_subgraph.shape[0] - 1
         trajectory_ID_to_indices[subgraph_ID] = (start_ID, end_ID)
         subgraph_ID_to_type[subgraph_ID] = 'agent'  #  标记 agent 子图类型
+        # D3：label 挂在**这个 agent 实际拿到的 subgraph_ID** 上（不是 agents_past 的下标 i）
+        #     —— 两者不同：不可用槽位被跳过后 subgraph_ID 不递增，而 i 照样递增。
+        #     用错会让 label 与子图错位，且**不会报错**（静默类缺陷）。
+        if subgraph_ID_to_label is not None:
+            subgraph_ID_to_label[subgraph_ID] = agent_labels[i]
         subgraph_ID += 1
 
     # —— 后面对 map_subgraph 的处理保持原样，只需在最后两列填 0 占位 ——
@@ -918,6 +961,11 @@ def encoding_vectornet_features(
         end_ID   = map_subgraph.shape[0] - 1
         map_ID_to_indices[subgraph_ID] = (start_ID, end_ID)
         subgraph_ID_to_type[subgraph_ID] = 'lane'  # ✅ 标记为地图子图
+        # D4：lane label 同样挂在**这条 lane 实际拿到的 subgraph_ID** 上。
+        #     lane 侧没有「不可用槽位」的跳过逻辑，但 subgraph_ID 是 agent 之后接着排的，
+        #     与 lane_idx 差一个偏移 —— 用 lane_idx 当键会与 agent 的键空间撞车。
+        if subgraph_ID_to_label is not None and lane_idx < len(lane_labels_list):
+            subgraph_ID_to_label[subgraph_ID] = lane_labels_list[lane_idx]
         subgraph_ID += 1
 
     # 决策A LANE-only：已删除重复的第二段 lane 编码（原双重编码致 subgraph_ID 翻倍、且无 type 标注）
@@ -974,7 +1022,7 @@ def encoding_vectornet_features(
         agent_futures_array
     ]]
 
-    return pd.DataFrame(feature_data, columns=[
+    columns = [
         "POLYLINE_FEATURES",
         "GROUND_TRUTH",
         "TRAJ_ID_TO_INDICES",
@@ -988,7 +1036,15 @@ def encoding_vectornet_features(
         "EGO_HISTORY",   # 添加ego历史轨迹列
         "AGENT_HISTORIES",
         "AGENT_FUTURES"
-    ])
+    ]
+
+    # 🔴 D3：**只有 drop_static=False 才追加这一列**。默认档的列集合逐字不变，
+    #    否则「新产物 mask 成现状后与旧产物逐字节相同」这道门无从谈起。
+    if subgraph_ID_to_label is not None:
+        feature_data[0].append(subgraph_ID_to_label)
+        columns.append("SUBGRAPH_ID_TO_LABEL")
+
+    return pd.DataFrame(feature_data, columns=columns)
 
 
 def save_features(df, name, dir_=None):

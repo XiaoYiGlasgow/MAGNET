@@ -34,15 +34,36 @@ except ImportError:
 # 全局变量记录当前使用的邻接矩阵配置
 CURRENT_ADJACENCY_CONFIG = "default"
 
+# 旋钮 A（D-2，判据 20260810）：子图时间池化的聚合统计量。全局默认 mean = 旧行为逐位不变；
+# 训练入口经 set_subgraph_agg() 设置，GraphDataset 据此命名 .pt 缓存（防静默复用 mean 缓存）。
+SUBGRAPH_AGG_FNS = {"mean": np.mean, "max": np.max, "sum": np.sum}
+CURRENT_SUBGRAPH_AGG = "mean"
+
+def set_subgraph_agg(name):
+    """设置子图池化聚合方式（mean/max/sum）；非法值当场 raise。"""
+    global CURRENT_SUBGRAPH_AGG
+    if name not in SUBGRAPH_AGG_FNS:
+        raise ValueError(f"未知 subgraph_agg: {name!r}，合法值 {sorted(SUBGRAPH_AGG_FNS)}")
+    CURRENT_SUBGRAPH_AGG = name
+
+def get_current_subgraph_agg():
+    """获取当前子图池化聚合方式名称"""
+    return CURRENT_SUBGRAPH_AGG
+
 # 内联定义所有需要的函数，避免导入错误
-def subgraph_pooling(polyline, subgraph_id_to_indices):
-    """简化的子图池化"""
+def subgraph_pooling(polyline, subgraph_id_to_indices, agg=None):
+    """简化的子图池化。agg=None 时用全局 CURRENT_SUBGRAPH_AGG（默认 mean = 旧行为）。"""
+    if agg is None:
+        agg = CURRENT_SUBGRAPH_AGG
+    if agg not in SUBGRAPH_AGG_FNS:
+        raise ValueError(f"未知 subgraph_agg: {agg!r}，合法值 {sorted(SUBGRAPH_AGG_FNS)}")
+    agg_fn = SUBGRAPH_AGG_FNS[agg]
     pooled_vectors = {}
     for subgraph_id, (start, end) in subgraph_id_to_indices.items():
         if end >= start and start < len(polyline):
             segment = polyline[start:end+1]
             if len(segment) > 0:
-                pooled = np.mean(segment, axis=0)
+                pooled = agg_fn(segment, axis=0)
                 if len(pooled) < 12:
                     pooled = np.pad(pooled, (0, 12 - len(pooled)))
                 elif len(pooled) > 12:
@@ -263,7 +284,13 @@ class GraphData(Data):
             return self.x.size(0)
         elif key == 'gnn_edge_index':
             return self.gnn_x.size(0) if self.gnn_x is not None else 0
-        elif key == 'cluster':
+        elif key == 'tg_edge_index':
+            # R1（Q76 重构）：逐帧场景图已在样本内部按帧偏移过，
+            # 批处理时再按本样本的总节点数 T*N 偏移一次。
+            # 旧样本没有 tg_x 字段 ⇒ 走不到这里，向后兼容。
+            return self.tg_x.size(0) if getattr(self, 'tg_x', None) is not None else 0
+        elif key in ('cluster', 'tg_frame'):
+            # tg_frame 是帧索引 0..T-1，跨样本不偏移（配合 tg_batch 区分样本）
             return 0
         else:
             return super().__inc__(key, value, *args, **kwargs)
@@ -453,9 +480,11 @@ def build_graph_data_from_feature_df(data, adjacency_config="default"):
 
 class GraphDataset(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None):
-        # 获取当前邻接矩阵配置
+        # 获取当前邻接矩阵配置与子图聚合方式（旋钮 A）
         self.adjacency_config = get_current_adjacency_config()
-        print(f"[INFO] Loading GraphDataset from: {root} with config: {self.adjacency_config}")
+        self.subgraph_agg = get_current_subgraph_agg()
+        print(f"[INFO] Loading GraphDataset from: {root} with config: {self.adjacency_config}, "
+              f"subgraph_agg: {self.subgraph_agg}")
         super().__init__(root, transform, pre_transform)
 
         pt_path = self.processed_paths[0]
@@ -473,8 +502,11 @@ class GraphDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        # 根据邻接矩阵配置命名处理后的文件
-        return [f'dataset_{self.adjacency_config}.pt']
+        # 根据邻接矩阵配置命名处理后的文件；非 mean 聚合带后缀（mean 保旧名 ⇒ 现有缓存不失效，
+        # 且杜绝 max/sum 静默复用 mean 缓存 —— 判据 20260810 §2-3 的头号风险门）
+        if self.subgraph_agg == "mean":
+            return [f'dataset_{self.adjacency_config}.pt']
+        return [f'dataset_{self.adjacency_config}_agg{self.subgraph_agg}.pt']
 
     @property
     def processed_dir(self):

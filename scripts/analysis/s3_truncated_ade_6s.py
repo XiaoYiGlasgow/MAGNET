@@ -104,9 +104,34 @@ def load_ckpt_into(model, ckpt_path: Path):
 
 @torch.no_grad()
 def eval_ckpt(model, loader, device: str, limit_batches: Optional[int] = None) -> Dict[str, float]:
-    """一遍 val，同时算 6 s 与 8 s 两个 horizon 的 ADE/FDE（top-1-by-probability 口径）。"""
+    """一遍 val，同时算 6 s 与 8 s 两个 horizon 的 ADE/FDE。
+
+    🆕 **Q84 扩展（08-05）**：除 top-1-by-probability 外，另算**逐模态**统计 ——
+    `oracle`（min over K）、`mean`（K 条平均，＝随机选模的期望）、`hit`（选对率）。
+
+    为什么需要（08-05 发现的两个口径缺口）：
+
+    1. **`gap = top1/oracle` 之前只在 8 s 上有**，而 MAGNET 是 6 s 原生
+       ⇒ 两边的 gap 从来没在同一 horizon 上比过。此前把 8 s 的 gap 与 6 s 的并列是错的：
+       horizon 越短各模态分岔越少 ⇒ oracle 优势越小 ⇒ gap 越小，方向可推但幅度未知。
+       本函数直接给出 **6 s 上的 oracle**，gap 才可比。
+    2. 🔴 **`gap` 本身混淆两件事**：低 gap 可能是「选得准」，也可能是「候选彼此更像
+       （挑错代价小）」。极端情形 K 条完全重合时 gap ≡ 1.0，看着完美其实选模无意义。
+       ⇒ 引入 **选模效率 η**（见下），它把候选离散度与绝对尺度都消掉。
+
+    **选模效率**::
+
+        η = (ADE_mean_modes − ADE_top1) / (ADE_mean_modes − ADE_oracle)
+
+    η = 1 ⇒ 选模完美（总挑到最优那条）；η = 0 ⇒ 等同随机挑。
+    分子分母同为「相对随机基线的改进量」⇒ **候选离散度与量纲都被约掉**，可跨模型直接比。
+    🔴 用**聚合值之比**（先各自在 val 上取均值再相除），不是逐样本 η 的均值 ——
+    逐样本分母在 K 条重合时趋 0，会炸。两种算法的差异属第八十三条，已在此声明选择。
+    """
     model = model.to(device).eval()
-    tot = {"n": 0, "ade60": 0.0, "fde60": 0.0, "ade80": 0.0, "fde80": 0.0}
+    tot = {"n": 0, "ade60": 0.0, "fde60": 0.0, "ade80": 0.0, "fde80": 0.0,
+           "orc_ade60": 0.0, "orc_ade80": 0.0, "orc_fde60": 0.0, "orc_fde80": 0.0,
+           "mean_ade60": 0.0, "mean_ade80": 0.0, "hit60": 0.0, "hit80": 0.0}
     for i, batch in enumerate(loader):
         if limit_batches is not None and i >= limit_batches:
             break
@@ -138,16 +163,45 @@ def eval_ckpt(model, loader, device: str, limit_batches: Optional[int] = None) -
         tot["ade60"] += d[:, :MAGNET_STEPS].mean(-1).sum().item()
         tot["fde60"] += d[:, MAGNET_STEPS - 1].sum().item()
 
+        # 🆕 Q84：逐模态误差（B,K,T）—— top-1 那几行**原封未动**，保证 r_ADE/r_FDE 逐位可复现
+        d_all = torch.norm(traj[..., :2] - tgt[:, None, :, :2], dim=-1)      # (B,K,T)
+        ade80_k = d_all.mean(-1)                                             # (B,K)
+        ade60_k = d_all[:, :, :MAGNET_STEPS].mean(-1)                        # (B,K)
+        tot["orc_ade80"] += ade80_k.min(dim=1).values.sum().item()
+        tot["orc_ade60"] += ade60_k.min(dim=1).values.sum().item()
+        tot["orc_fde80"] += d_all[:, :, -1].min(dim=1).values.sum().item()
+        tot["orc_fde60"] += d_all[:, :, MAGNET_STEPS - 1].min(dim=1).values.sum().item()
+        tot["mean_ade80"] += ade80_k.mean(dim=1).sum().item()
+        tot["mean_ade60"] += ade60_k.mean(dim=1).sum().item()
+        # 选对率：argmax(prob) 是否命中该 horizon 上误差最小的那条
+        tot["hit80"] += (best == ade80_k.argmin(dim=1)).float().sum().item()
+        tot["hit60"] += (best == ade60_k.argmin(dim=1)).float().sum().item()
+
     n = tot["n"]
     if n == 0:
         raise RuntimeError("val dataloader 一个样本都没给出")
-    return {
+    def _eta(mean_v: float, top1_v: float, orc_v: float) -> float:
+        """选模效率 η；分母为 0（K 条完全重合）时返回 nan，绝不返回 1.0 冒充「完美」。"""
+        den = mean_v - orc_v
+        return (mean_v - top1_v) / den if den > 0 else float("nan")
+
+    res = {
         "n_samples": n,
         "ADE_8s": tot["ade80"] / n, "FDE_8s": tot["fde80"] / n,
         "ADE_6s": tot["ade60"] / n, "FDE_6s": tot["fde60"] / n,
         "r_ADE": (tot["ade60"] / n) / (tot["ade80"] / n),
         "r_FDE": (tot["fde60"] / n) / (tot["fde80"] / n),
+        # 🆕 Q84：逐模态统计
+        "oracle_ADE_8s": tot["orc_ade80"] / n, "oracle_ADE_6s": tot["orc_ade60"] / n,
+        "oracle_FDE_8s": tot["orc_fde80"] / n, "oracle_FDE_6s": tot["orc_fde60"] / n,
+        "meanmode_ADE_8s": tot["mean_ade80"] / n, "meanmode_ADE_6s": tot["mean_ade60"] / n,
+        "hit_rate_8s": tot["hit80"] / n, "hit_rate_6s": tot["hit60"] / n,
     }
+    res["gap_8s"] = res["ADE_8s"] / res["oracle_ADE_8s"]
+    res["gap_6s"] = res["ADE_6s"] / res["oracle_ADE_6s"]
+    res["eta_8s"] = _eta(res["meanmode_ADE_8s"], res["ADE_8s"], res["oracle_ADE_8s"])
+    res["eta_6s"] = _eta(res["meanmode_ADE_6s"], res["ADE_6s"], res["oracle_ADE_6s"])
+    return res
 
 
 def pick_ckpts(tier: str, seed: int, k: int) -> List[Path]:

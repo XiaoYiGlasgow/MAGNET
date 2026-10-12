@@ -67,15 +67,45 @@ def _git_provenance(repo: Path) -> Dict[str, str]:
 
 
 def load_token_to_log(split_manifest: Path) -> Tuple[Path, Dict[str, str], List[str]]:
-    """读 split manifest，返回 (train_root, token->log_name, train_logs)。"""
+    """读 split manifest，返回 (train_root, token->log_name, train_logs)。
+
+    🔴 **两种 split manifest schema 都要支持，且必须显式分支**（08-05）：
+
+    * **F1 侧** `split3_manifest.json`：直接给 ``logs.train`` / ``logs.val``；
+    * **L1 侧** `processed_features_scaling_L1_logsplit/split_manifest.json`（Q64 的
+      `splitter_yaml` 产物）：**只给 ``val_logs``**，train 侧的 log 列表要用
+      「父 manifest 的全部 log 减去 val_logs」推出来。
+
+    不做「schema 猜测 + 静默兜底」——认不出的 schema 直接抛错，
+    因为猜错的后果是 calibration 用错 split（firewall 破裂）而**不会有任何报错**。
+    """
     sm = json.loads(split_manifest.read_text())
     train_root = Path(sm["train_root"])
     parent_manifest = Path(sm["manifest"])
     entries = json.loads(parent_manifest.read_text())
     token_to_log = {e["token"]: e["log_name"] for e in entries}
-    train_logs = list(sm["logs"]["train"])
-    logger.info("split manifest: train_root=%s, train logs=%d, token 表=%d",
-                train_root, len(train_logs), len(token_to_log))
+
+    if isinstance(sm.get("logs"), dict) and "train" in sm["logs"]:
+        train_logs = list(sm["logs"]["train"])
+        schema = "logs.train（F1 split3）"
+    elif "val_logs" in sm:
+        # L1 schema：train = 父 manifest 覆盖的全部 log − val_logs
+        val_logs = set(sm["val_logs"])
+        train_logs = sorted({e["log_name"] for e in entries} - val_logs)
+        schema = "val_logs 取补集（L1 logsplit）"
+        # 交叉校验：推出来的 train log 数必须与 manifest 自报的一致，否则 split 认知有偏差
+        declared = sm.get("n_logs_train")
+        if declared is not None and len(train_logs) != declared:
+            logger.warning("🔴 推出的 train log 数 %d ≠ manifest 自报的 n_logs_train %d"
+                           " —— 父 manifest 覆盖范围大于本级 split（下游 scan 会按实际 pkl 过滤）",
+                           len(train_logs), declared)
+    else:
+        raise RuntimeError(
+            f"{split_manifest} 的 schema 不认识：既没有 logs.train 也没有 val_logs。"
+            "拒绝猜测 —— 猜错会让 calibration 用错 split 且不报错。")
+
+    logger.info("split manifest: train_root=%s, train logs=%d（schema=%s）, token 表=%d",
+                train_root, len(train_logs), schema, len(token_to_log))
     return train_root, token_to_log, train_logs
 
 

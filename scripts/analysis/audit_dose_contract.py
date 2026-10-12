@@ -42,10 +42,29 @@ class Dose:
 
 
 #: 冻结的剂量网格（协议 §3.1）。⚠️ fraction 口径禁止 ρ=1.0（两类实体全删 ⇒ 图为空）。
+#: 🔴 **这三个不得改动** —— 已落盘的 G19 / R1 shard 全部依赖它们逐位复现
+#: （回归门见 `tests/test_audit_dose_contract.py`）。
 DOSES: Tuple[Dose, ...] = (
     Dose("count_sat", "count", 1.0),             # k = min(n_target, n_control)，功效最大
     Dose("count_1", "count", 1, absolute=True),  # R3-M2 字面版：移除单个周围车辆
     Dose("frac_25", "fraction", 0.25),           # fraction-matched primary
+)
+
+#: 🆕 **剂量-反应扫描网格**（Q83，08-05 新增，**不进 primary family**）。
+#:
+#: 动机（08-05 实测）：`S = response(agent) − response(lane)` 的**符号完全由两侧删除
+#: 个数之比决定**，与模型无关 —— 18 格（2 架构 × 3 seed × 3 剂量）无一例外：
+#: 比值 1.00×（`count_1` / `count_sat`）⇒ S 恒**正**；比值 7.07×（`frac_25`）⇒ S 恒**负**。
+#: ⇒ 「哪个模态更重要」这个问法本身是**剂量依赖的、良定义不了的**。
+#:
+#: 本网格把剂量比 `R = k_control / k_target` 变成**唯一变量**（固定 `k_target = 1`），
+#: 用来估计**交换率 R\***：**删几个 lane 才等价于删 1 个 agent**。
+#: R\* 是**剂量不变**的量，可跨模型/跨架构比较 —— 它替代了那个良定义不了的问法。
+#:
+#: 🔴 `ratio_1` 与 `count_1` 在语义上等价（1 vs 1），**故意保留**作为自校验点：
+#: 两者的读数必须逐位相同，否则说明新模式的实现与冻结契约分叉了。
+RATIO_DOSES: Tuple[Dose, ...] = tuple(
+    Dose(f"ratio_{r}", "ratio", r) for r in (1, 2, 3, 5, 7, 10, 14, 20)
 )
 
 
@@ -84,4 +103,16 @@ def resolve_dose(dose: Dose, n_target: int, n_control: int,
         if k_t <= 0 or k_c <= 0:
             return 0, 0, f"fraction 剂量解析为 0 个{unit}（k_t={k_t}, k_c={k_c}）"
         return k_t, k_c, None
+    if dose.mode == "ratio":
+        # 剂量比 R 是唯一变量：固定 k_target = 1，k_control = R。
+        # 🔴 **绝不 clamp**：若 n_control < R，实际比值就不是 R 了，
+        # 混进曲线会把「S 在 R 处的取值」算错，而且**不会有任何报错**
+        # —— 这正是剂量混杂本身的失效形态，不能在修它的实验里重演一次。
+        r = int(dose.value)
+        if n_target < 1:
+            return 0, 0, f"ratio 剂量需要至少 1 个 target {unit}（n_t={n_target}）"
+        if n_control < r:
+            return 0, 0, (f"ratio 剂量比 R={r} 不可达：control 侧只有 {n_control} 个{unit}"
+                          f"（clamp 会静默改变实际比值，故跳过）")
+        return 1, r, None
     raise ValueError(f"未知 matched 口径 {dose.mode!r}")

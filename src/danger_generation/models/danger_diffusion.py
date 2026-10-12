@@ -23,7 +23,9 @@ from dataclasses import dataclass
 
 from shared.utils.svo_torch import (SvoTorchConfig, svo_dps_loss,
                                     compute_ego_svo_torch,
-                                    compute_ego_svo_torch_timevarying)
+                                    compute_ego_svo_torch_timevarying,
+                                    compute_svo_soft_cumulative_torch,
+                                    default_svo_soft_cfg)
 from shared.utils.bezier_torch_v6_0 import bezier_guidance_v6_0
 from shared.utils.danger_score_torch import (lane_deviation_score_torch,
                                              compute_single_trajectory_danger_torch,
@@ -1272,6 +1274,23 @@ class DangerSceneDiffusion(nn.Module):
                 agent_svo_list.append(ego_dxdy.new_zeros(()))
         return torch.stack(ego_svo_list), torch.stack(agent_svo_list)
 
+    @staticmethod
+    def _grad_or_zeros_phase2(
+        loss: torch.Tensor,
+        leaf: torch.Tensor,
+        retain_graph: bool,
+    ) -> torch.Tensor:
+        """[路线 A] 求 d(loss)/d(leaf)，loss 与 leaf 无关（或不带梯度）时返回全 0；结果 detach。
+
+        只在 svo_step>0（SVO 梯度与其余项分开求）时使用，默认路径不经过这里。
+        """
+        if not (torch.is_tensor(loss) and loss.requires_grad):
+            return torch.zeros_like(leaf).detach()
+        grad = torch.autograd.grad(loss, leaf, retain_graph=retain_graph, allow_unused=True)[0]
+        if grad is None:
+            return torch.zeros_like(leaf).detach()
+        return grad.detach()
+
     def sdedit_with_full_guidance_phase2(
         self,
         x_0: torch.Tensor,
@@ -1325,6 +1344,12 @@ class DangerSceneDiffusion(nn.Module):
         ego_relative_delta_deg: Optional[float] = None,    # None→relative_delta_deg；越大 ego 越激进（target=baseline−delta 更竞争）
         agent_relative_delta_deg: Optional[float] = None,  # None→relative_delta_deg；越小 agent 越被动（靠 joint 先验反应）
         debug: bool = False,
+        # ── 路线 A（09-16）SVO guidance 修复开关：默认值 = 现行为（逐位不变），新参数一律放在 debug 之后 ──
+        svo_measure: str = 'timevarying',          # 'timevarying'：旧口径（由 svo_timevarying 决定逐帧/标量）；'soft_cumulative'：可微软累加 SVO（用户 09-13 累加定义的软化版）
+        svo_soft_cfg: Optional[dict] = None,       # 软累加参数；None → default_svo_soft_cfg() = dict(dth=3, ath=2, sc=1.6, acc_smooth=5, seam_skip=4)；给出时只覆盖给出的键
+        svo_loss_mode: str = 'relu',               # 'relu'：旧单向 relu(α−target).mean()；'two_sided'：只用末帧 α(T)，smooth_l1(beta=1°) 双向拉向目标
+        svo_step: float = 0.0,                     # >0：SVO 梯度与其余项分开求，lowpass 后按样本单位化，×svo_step×eff_scale 叠加（0 = 旧「一个总梯度」路径）
+        agent_svo_target_deg: Optional[float] = None,  # 仅 use_relative_target=False 时生效；None → agent 与 ego 同用 svo_target_deg
     ) -> torch.Tensor:
         """[Phase2] SDEdit with full three-term DPS guidance.
 
@@ -1352,6 +1377,19 @@ class DangerSceneDiffusion(nn.Module):
                 ego-agent together when farther than this.
             lane_half_width: lane half-width threshold (m).
 
+        路线 A（09-16）新增参数（默认值 = 现行为，逐位不变）：
+            svo_measure: 'soft_cumulative' 时 SVO 度量改为 compute_svo_soft_cumulative_torch
+                （ego 初始量取历史真实段硬计数，agent 初始 0；只依赖各自速度），
+                此时 svo_timevarying / svo_config 不参与 SVO 项；use_relative_target=True 时
+                基线也用同一软累加函数在 x_0 上算（逐帧 (B,T)，no_grad）再减 delta。
+            svo_soft_cfg: 软累加参数（dth/ath/sc/acc_smooth/seam_skip），None 取默认。
+            svo_loss_mode: 'two_sided' 时 SVO loss = smooth_l1(α(T), target(T), beta=1°) 的 batch 均值，
+                ego 与 agent（若有）各一项相加；'relu' 沿用 relu(α−target).mean()。
+            svo_step: >0 时 SVO 梯度 g_svo = d(svo_weight·svo_loss)/dx 单独求，其余项梯度走原路径
+                （lowpass / bezier / 夹子分支逻辑不变）；g_svo 做同样的 lowpass（若开）后按样本单位化
+                （范数 < 1e-8 的样本置 0），再乘 svo_step·eff_scale 叠加进 guidance。
+            agent_svo_target_deg: 绝对目标模式下 agent 的目标角；None 时与 ego 相同。
+
         Returns:
             (B, 240) generated trajectories in (dx, dy) space.
 
@@ -1370,6 +1408,15 @@ class DangerSceneDiffusion(nn.Module):
 
         if svo_config is None:
             svo_config = SvoTorchConfig()
+        # 路线 A：新开关校验 + 软累加参数解析（纯 Python，默认值时不引入任何张量计算）
+        if svo_measure not in ('timevarying', 'soft_cumulative'):
+            raise ValueError(f"svo_measure 须为 'timevarying' 或 'soft_cumulative'，得到 {svo_measure!r}")
+        if svo_loss_mode not in ('relu', 'two_sided'):
+            raise ValueError(f"svo_loss_mode 须为 'relu' 或 'two_sided'，得到 {svo_loss_mode!r}")
+        _use_soft_svo = svo_measure == 'soft_cumulative'
+        _soft_cfg = default_svo_soft_cfg()
+        if svo_soft_cfg is not None:
+            _soft_cfg.update(svo_soft_cfg)
         # 方式二(c)：解析 danger_score 配置（默认与 eval numpy DangerScoreConfig 阈值一致 → 闭合 eval）
         _danger_cfg = danger_score_config if danger_score_config is not None else DangerScoreConfigTorch()
         if lane_half_width is None:
@@ -1377,9 +1424,20 @@ class DangerSceneDiffusion(nn.Module):
 
         # [Phase2] Per-sample relative SVO targets for BOTH ego and agent ──────
         if use_relative_target:
-            with torch.no_grad():
-                base_ego_svo, base_agent_svo = self._compute_baseline_svo_pair_phase2(
-                    x_0, ego_history, agent_history, svo_config)
+            if _use_soft_svo:
+                # 路线 A：基线与 guidance 同口径——软累加函数在 x_0 上算逐帧 α (B,T)（no_grad），再减 delta
+                with torch.no_grad():
+                    base_ego_svo = compute_svo_soft_cumulative_torch(
+                        x_0[:, :120].detach().reshape(batch_size, 60, 2), ego_history, _soft_cfg)
+                    if agent_history is not None:
+                        base_agent_svo = compute_svo_soft_cumulative_torch(
+                            x_0[:, 120:].detach().reshape(batch_size, 60, 2), None, _soft_cfg)
+                    else:
+                        base_agent_svo = torch.zeros_like(base_ego_svo)
+            else:
+                with torch.no_grad():
+                    base_ego_svo, base_agent_svo = self._compute_baseline_svo_pair_phase2(
+                        x_0, ego_history, agent_history, svo_config)
             # 角色不对称（精修②）：ego/agent 各自 delta，None 时回落到统一 relative_delta_deg（向后兼容）
             _ego_delta   = (relative_delta_deg if ego_relative_delta_deg is None
                             else ego_relative_delta_deg)
@@ -1390,7 +1448,12 @@ class DangerSceneDiffusion(nn.Module):
         else:
             ego_target   = torch.full((batch_size,), svo_target_deg,
                                       device=device, dtype=x_0.dtype)
-            agent_target = ego_target.clone()
+            if agent_svo_target_deg is None:
+                agent_target = ego_target.clone()
+            else:
+                # 路线 A：agent 单独的绝对目标角
+                agent_target = torch.full((batch_size,), agent_svo_target_deg,
+                                          device=device, dtype=x_0.dtype)
 
         # Batched last positions (for ego/agent absolute position reconstruction)
         if ego_history.dim() == 3:
@@ -1442,29 +1505,52 @@ class DangerSceneDiffusion(nn.Module):
                 # target 是全程固定的激进偏移（baseline−delta）= 初始激进承诺；
                 # 时变 SVO 里 social force 在近距离自动推高 SVO（避让），与 target 拉锯，
                 # 净效果"远激进、近避让"由 ego-agent 距离决定，无需硬分前后段。
-                _svo_fn = (compute_ego_svo_torch_timevarying if svo_timevarying
-                           else compute_ego_svo_torch)
-                ego_svo_list, agent_svo_list = [], []
-                for i in range(B_inner):
-                    ego_hist_i = (ego_history[i]
-                                  if ego_history.dim() == 3 else ego_history)
-                    a_pos_i = (agent_pos[i].detach() if agent_pos is not None else None)
-                    ego_svo_list.append(_svo_fn(ego_dxdy[i], ego_hist_i, a_pos_i, svo_config))
-                    if agent_history is not None:
-                        agent_hist_i = (agent_history[i]
-                                        if agent_history.dim() == 3 else agent_history)
-                        agent_svo_list.append(
-                            _svo_fn(agent_dxdy[i], agent_hist_i, ego_pos[i].detach(), svo_config))
-                ego_svo_batch = torch.stack(ego_svo_list)            # (B,) or (B,T)
-                _ego_tgt = ego_target.unsqueeze(1) if ego_svo_batch.dim() == 2 else ego_target
-                svo_loss = F.relu(ego_svo_batch - _ego_tgt).mean()
+                if _use_soft_svo:
+                    # 路线 A：软累加 SVO (B,T)。ego 初始量来自历史硬计数，agent 初始 0（用户 09-13 定）；
+                    # 只依赖各自速度、不需要对方位置 → ego/agent 之间不互传 SVO 梯度（与旧口径 detach 对方位置一致）。
+                    ego_svo_batch = compute_svo_soft_cumulative_torch(ego_dxdy, ego_history, _soft_cfg)
+                    agent_svo_batch = (compute_svo_soft_cumulative_torch(agent_dxdy, None, _soft_cfg)
+                                       if agent_history is not None else None)
+                else:
+                    _svo_fn = (compute_ego_svo_torch_timevarying if svo_timevarying
+                               else compute_ego_svo_torch)
+                    ego_svo_list, agent_svo_list = [], []
+                    for i in range(B_inner):
+                        ego_hist_i = (ego_history[i]
+                                      if ego_history.dim() == 3 else ego_history)
+                        a_pos_i = (agent_pos[i].detach() if agent_pos is not None else None)
+                        ego_svo_list.append(_svo_fn(ego_dxdy[i], ego_hist_i, a_pos_i, svo_config))
+                        if agent_history is not None:
+                            agent_hist_i = (agent_history[i]
+                                            if agent_history.dim() == 3 else agent_history)
+                            agent_svo_list.append(
+                                _svo_fn(agent_dxdy[i], agent_hist_i, ego_pos[i].detach(), svo_config))
+                    ego_svo_batch = torch.stack(ego_svo_list)            # (B,) or (B,T)
+                    agent_svo_batch = torch.stack(agent_svo_list) if agent_svo_list else None
                 agent_svo_mean = float('nan')
-                if agent_svo_list:
-                    agent_svo_batch = torch.stack(agent_svo_list)
-                    _agent_tgt = (agent_target.unsqueeze(1)
-                                  if agent_svo_batch.dim() == 2 else agent_target)
-                    svo_loss = svo_loss + F.relu(agent_svo_batch - _agent_tgt).mean()
-                    agent_svo_mean = agent_svo_batch.mean().item()
+                if svo_loss_mode == 'two_sided':
+                    # 路线 A：只用末帧 α(T)，smooth_l1(beta=1°) 双向拉向目标；ego 与 agent 各一项（batch 均值）相加
+                    _ego_T = ego_svo_batch[:, -1] if ego_svo_batch.dim() == 2 else ego_svo_batch
+                    _ego_tgt_T = ego_target[:, -1] if ego_target.dim() == 2 else ego_target
+                    svo_loss = F.smooth_l1_loss(_ego_T, _ego_tgt_T, reduction='mean', beta=1.0)
+                    if agent_svo_batch is not None:
+                        _agent_T = (agent_svo_batch[:, -1] if agent_svo_batch.dim() == 2
+                                    else agent_svo_batch)
+                        _agent_tgt_T = agent_target[:, -1] if agent_target.dim() == 2 else agent_target
+                        svo_loss = svo_loss + F.smooth_l1_loss(
+                            _agent_T, _agent_tgt_T, reduction='mean', beta=1.0)
+                        agent_svo_mean = agent_svo_batch.mean().item()
+                else:
+                    # 旧单向 relu（target 为 (B,) 时对逐帧序列广播；软累加相对目标本身是 (B,T)，直接逐帧比）
+                    _ego_tgt = (ego_target.unsqueeze(1)
+                                if ego_svo_batch.dim() == 2 and ego_target.dim() == 1 else ego_target)
+                    svo_loss = F.relu(ego_svo_batch - _ego_tgt).mean()
+                    if agent_svo_batch is not None:
+                        _agent_tgt = (agent_target.unsqueeze(1)
+                                      if agent_svo_batch.dim() == 2 and agent_target.dim() == 1
+                                      else agent_target)
+                        svo_loss = svo_loss + F.relu(agent_svo_batch - _agent_tgt).mean()
+                        agent_svo_mean = agent_svo_batch.mean().item()
 
                 # (2) Proximity / closing-speed objective ─────────────────────
                 proximity_loss = x0_approx.new_zeros(())
@@ -1533,12 +1619,22 @@ class DangerSceneDiffusion(nn.Module):
                 if kin_constrain_agent and agent_pos is not None:
                     kin_loss = kin_loss + self._kinematic_realism_loss_v6_0(x0_approx[:, 120:])
 
-                total_loss = (svo_weight       * svo_loss
-                              + proximity_weight * proximity_loss
-                              + lane_weight      * lane_loss
-                              + lambda_kinematic * kin_loss)
+                g_svo = None
+                if svo_step > 0.0:
+                    # 路线 A：SVO 梯度与其余项分开求——其余项梯度 g 走下面原有路径（逻辑一字不改），
+                    # SVO 梯度 g_svo 在后面单独 lowpass + 按样本单位化，不再被 danger 梯度的整体截断淹没。
+                    rest_loss = (proximity_weight * proximity_loss
+                                 + lane_weight      * lane_loss
+                                 + lambda_kinematic * kin_loss)
+                    g = self._grad_or_zeros_phase2(rest_loss, x_leaf, retain_graph=True)
+                    g_svo = self._grad_or_zeros_phase2(svo_weight * svo_loss, x_leaf, retain_graph=False)
+                else:
+                    total_loss = (svo_weight       * svo_loss
+                                  + proximity_weight * proximity_loss
+                                  + lane_weight      * lane_loss
+                                  + lambda_kinematic * kin_loss)
 
-                g = torch.autograd.grad(total_loss, x_leaf)[0].detach()
+                    g = torch.autograd.grad(total_loss, x_leaf)[0].detach()
 
                 if use_lowpass:
                     g = self._lowpass_guidance_v6_0(g, cutoff_ratio=lowpass_cutoff_ratio)
@@ -1570,7 +1666,24 @@ class DangerSceneDiffusion(nn.Module):
                     gout_norm = guidance.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                     guidance  = guidance * (gout_norm.clamp(max=grad_clip_norm) / gout_norm)
 
+                g_svo_norm_mean = float('nan')
+                if g_svo is not None:
+                    # 路线 A：SVO 推力 = 同样 lowpass（若开）→ 按样本单位化（范数<1e-8 的样本置 0）→ ×svo_step×eff_scale，
+                    # 叠加在「其余项已按原路径截断/缩放」之后的 guidance 上
+                    if use_lowpass:
+                        g_svo = self._lowpass_guidance_v6_0(g_svo, cutoff_ratio=lowpass_cutoff_ratio)
+                    _svo_gn = g_svo.norm(dim=-1, keepdim=True)
+                    g_svo_dir = torch.where(_svo_gn < 1e-8, torch.zeros_like(g_svo),
+                                            g_svo / _svo_gn.clamp(min=1e-8))
+                    guidance = guidance + (eff_scale * svo_step) * g_svo_dir
+                    if debug:
+                        g_svo_norm_mean = _svo_gn.mean().item()
+
                 if debug:
+                    # 路线 A 诊断：软累加末帧 α(T) 均值（仅 soft_cumulative 时有值，其余为 nan）
+                    _soft_ego_T = (ego_svo_batch[:, -1].mean().item() if _use_soft_svo else float('nan'))
+                    _soft_agent_T = (agent_svo_batch[:, -1].mean().item()
+                                     if (_use_soft_svo and agent_svo_batch is not None) else float('nan'))
                     _diag_steps.append({
                         "t": t,
                         "ego_svo": ego_svo_batch.mean().item(),
@@ -1588,6 +1701,10 @@ class DangerSceneDiffusion(nn.Module):
                         # 更快衰减（软归一化生效）；g_ref=0 时 guid_norm≈eff_scale（单位向量不随 loss 衰减）。
                         "g_norm": g_norm.mean().item(),
                         "guid_norm": guidance.norm(dim=-1).mean().item(),
+                        # 路线 A：软累加末帧 α(T)（ego/agent 均值）与 SVO 原始梯度范数（svo_step>0 时，lowpass 后、单位化前）
+                        "svo_soft_ego_T": _soft_ego_T,
+                        "svo_soft_agent_T": _soft_agent_T,
+                        "g_svo_norm": g_svo_norm_mean,
                     })
 
                 x_corrected = x.detach() - guidance
@@ -1659,6 +1776,13 @@ class DangerSceneDiffusion(nn.Module):
                   f"(ego_target≈{ego_target.mean().item():.2f}°)")
             print(f"[Phase2 diag] agent SVO drift: {sN['agent_svo']:.2f}° → {s0['agent_svo']:.2f}°  "
                   f"(agent_target≈{agent_target.mean().item():.2f}°)")
+            if _use_soft_svo or svo_step > 0.0:
+                _gsn = [d['g_svo_norm'] for d in _diag_steps if d['g_svo_norm'] == d['g_svo_norm']]
+                _gsn_mean = sum(_gsn) / len(_gsn) if _gsn else float('nan')
+                print(f"[Phase2 diag] 路线A measure={svo_measure} loss={svo_loss_mode} svo_step={svo_step}  "
+                      f"soft α(T) ego: {sN['svo_soft_ego_T']:.2f}° → {s0['svo_soft_ego_T']:.2f}°  "
+                      f"agent: {sN['svo_soft_agent_T']:.2f}° → {s0['svo_soft_agent_T']:.2f}°  "
+                      f"g_svo_norm(步均)={_gsn_mean:.4f}")
 
         return x
 

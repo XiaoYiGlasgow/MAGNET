@@ -42,7 +42,8 @@ from nuplan.common.actor_state.state_representation import (  # noqa: E402
 from nuplan.common.actor_state.tracked_objects import TrackedObjects  # noqa: E402
 from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters  # noqa: E402
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks  # noqa: E402
-from nuplan.planning.simulation.planner.gnn_trans_planner import GNNTransPlanner  # noqa: E402
+from nuplan.planning.simulation.planner.gnn_trans_planner import (  # noqa: E402
+    GNNTransPlanner, _increments_to_local_pos)
 
 _ENV_VARS = ("MAGNET_PLANNING_LAYER", "MAGNET_REFERENCE_SOURCE")
 
@@ -93,6 +94,15 @@ def _model_output(seed: int = 0, step: float = 0.6) -> torch.Tensor:
     inc[1:, 0] = step
     inc[1:, 1] = 0.02 * torch.randn(59, generator=g)
     return inc.reshape(1, -1)
+
+
+def _local_pos(seed: int = 0, step: float = 0.6) -> np.ndarray:
+    """[60,2] 局部累计位移 —— `_output_to_trajectory` 在 2026-08-25 之后的入口口径。
+
+    🔴 `_golden_trajectory` 仍吃**原始增量**（它复刻的是接线前的算法），所以判据 [L2]
+    比的依然是「接线前 vs 现在」，抬口径这件事本身也被这条判据罩住。
+    """
+    return _increments_to_local_pos(_model_output(seed=seed, step=step), 60)
 
 
 def _make_planner(**kwargs) -> GNNTransPlanner:
@@ -170,7 +180,7 @@ def test_L2_disabled_path_is_bitwise_identical() -> None:
     try:
         p = _make_planner()
         st = _ego_state()
-        out = _as_array(p._output_to_trajectory(_model_output(), _FakeInput(st)))
+        out = _as_array(p._output_to_trajectory(_local_pos(), _FakeInput(st)))
         ref = _golden_trajectory(_model_output(), st)
         assert out.shape == ref.shape, f"点数变了：{out.shape} vs {ref.shape}"
         delta = float(np.max(np.abs(out - ref)))
@@ -208,9 +218,9 @@ def test_L4_enabled_changes_output_and_keeps_first_point() -> None:
     old = _clear_env()
     try:
         st = _ego_state()
-        base = _as_array(_make_planner()._output_to_trajectory(_model_output(), _FakeInput(st)))
+        base = _as_array(_make_planner()._output_to_trajectory(_local_pos(), _FakeInput(st)))
         os.environ["MAGNET_PLANNING_LAYER"] = "full"
-        on = _as_array(_make_planner()._output_to_trajectory(_model_output(), _FakeInput(st)))
+        on = _as_array(_make_planner()._output_to_trajectory(_local_pos(), _FakeInput(st)))
         assert float(np.max(np.abs(on - base))) > 0.0, "开了层却什么都没变 ⇒ 开关没接上"
         assert on[0, 0] == base[0, 0] and on[0, 1] == base[0, 1], "首点必须仍是 ego 当前位姿"
         assert np.all(np.isfinite(on)), "开层后轨迹里不得出现 NaN/Inf"
@@ -229,8 +239,8 @@ def test_L5_cv_reference_bypasses_the_model() -> None:
     try:
         os.environ["MAGNET_REFERENCE_SOURCE"] = "cv"
         st = _ego_state()
-        a = _as_array(_make_planner()._output_to_trajectory(_model_output(seed=0), _FakeInput(st)))
-        b = _as_array(_make_planner()._output_to_trajectory(_model_output(seed=7, step=2.0),
+        a = _as_array(_make_planner()._output_to_trajectory(_local_pos(seed=0), _FakeInput(st)))
+        b = _as_array(_make_planner()._output_to_trajectory(_local_pos(seed=7, step=2.0),
                                                            _FakeInput(st)))
         delta = float(np.max(np.abs(a - b)))
         assert delta == 0.0, f"CV 上游仍受模型输出影响 max|Δ|={delta:.3e}"
