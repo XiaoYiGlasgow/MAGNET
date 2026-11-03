@@ -18,6 +18,16 @@ features, checkpoints, experiment outputs and internal work records are not incl
 This is an active research snapshot rather than a packaged Python library. It supports source and
 protocol inspection; it does not provide a one-command reproduction of the manuscript tables.
 
+## Examples
+
+Inference-time interaction weights during two nuPlan scenario replays. The ego vehicle is shown in
+red and surrounding vehicles in green; each black line is an agent-to-ego edge whose width and label
+give the vehicle-to-vehicle weight assigned by the learned edge scorer. The weights change as the
+scene evolves.
+
+- [Example 1](docs/media/magnet_edge_weights_example1.mp4)
+- [Example 2](docs/media/magnet_edge_weights_example2.mp4)
+
 ## What is in this release
 
 - **Joint predictor** (`scripts/training/magnet_joint_*.py`): entity encoder with attention pooling
