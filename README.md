@@ -1,8 +1,8 @@
 # MAGNET
 
 MAGNET (Multi-agent Attributed Graph Network Transformer) is research code for joint multi-agent,
-multimodal trajectory prediction on nuPlan. It accompanies the manuscript *Counterfactual
-Supervision of Adaptive Interaction Topology for Multi-Vehicle Trajectory Prediction*.
+multimodal trajectory prediction on nuPlan. It accompanies the manuscript *Multi-agent Trajectory
+Prediction for Autonomous Driving with Counterfactually Supervised Interaction Topology*.
 
 The model keeps a separate token for every vehicle and lane element from encoding to decoding, so
 that individual source and target entities remain addressable. On top of this representation, the
@@ -123,8 +123,9 @@ in [`docs/feature_schema_v2.md`](docs/feature_schema_v2.md).
 
 - Segment features have 12 fields; the entity encoder reads the first nine.
 - History is 20 frames (2 s at 10 Hz); the prediction horizon is 60 frames (6 s at 10 Hz).
-- Joint targets are absolute positions in the ego-centred frame at prediction time, for the ego
-  vehicle and for every represented surrounding vehicle with a valid future. Surrounding-vehicle
+- Joint targets are positions in the ego-centred frame at prediction time for every represented
+  surrounding vehicle with a valid future; ego targets are expressed relative to the ego position
+  at the first future timestamp (t0 + 0.1 s), as in the manuscript. Surrounding-vehicle
   targets are attached by the agent cache below; truncated futures are masked frame by frame.
 
 Data and checkpoints are intentionally excluded from GitHub. Several preprocessing entry points
@@ -167,12 +168,14 @@ python scripts/training/train_magnet_imitation.py \
   --seed 1 --device cuda:0
 ```
 
-**4. Counterfactual utility labels.** Compute source-to-target utilities with a trained fixed-topology
-model as the teacher, then merge the shards:
+**4. Counterfactual utility labels.** Compute source-to-target utilities with the three trained
+fixed-topology models as teachers (the median over teachers is stored), then merge the shards:
 
 ```bash
 python scripts/analysis/s3_edge_utility_labels.py \
   --teacher /path/to/output/fixed_seed1/models/checkpoint_best.pt \
+            /path/to/output/fixed_seed2/models/checkpoint_best.pt \
+            /path/to/output/fixed_seed42/models/checkpoint_best.pt \
   --root /path/to/features_split/train --out /path/to/edge_labels/train --device cuda:0
 python scripts/analysis/s3_merge_parts.py --root /path/to/edge_labels/train
 # repeat for val
