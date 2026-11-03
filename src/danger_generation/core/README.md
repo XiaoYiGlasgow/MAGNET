@@ -1,96 +1,96 @@
-# Diffusion Danger Model - 数据处理
+# Diffusion Danger Model - Data Processing
 
-## 目录结构
+## Directory Structure
 
 ```
 diffusion_danger_model/
-├── config.py              # 配置文件
-├── process_pittsburgh.py  # Pittsburgh数据处理脚本
-├── processed_data/        # 输出数据目录
-│   ├── features_*.pkl     # 处理后的特征文件
-│   └── processing_report_*.md  # 自动生成的处理报告
-└── utils/                 # 工具函数（如需要）
+├── config.py              # Configuration file
+├── process_pittsburgh.py  # Pittsburgh data processing script
+├── processed_data/        # Output data directory
+│   ├── features_*.pkl     # Processed feature files
+│   └── processing_report_*.md  # Automatically generated processing report
+└── utils/                 # Utility functions (if needed)
 ```
 
-## 配置说明
+## Configuration
 
-| 参数 | 值 | 说明 |
+| Parameter | Value | Description |
 |------|---|------|
-| PAST_TIME_HORIZON | 4秒 | 历史时间窗口 |
-| FUTURE_TIME_HORIZON | 6秒 | 未来时间窗口 |
-| NUM_PAST_POSES | 40帧 | 历史轨迹帧数 |
-| NUM_FUTURE_POSES | 60帧 | 未来轨迹帧数 |
-| NUM_AGENTS | 30 | 最大周围车辆上限 |
-| QUERY_RADIUS | 50m | 地图车道提取范围 |
-| MIN_DISPLACEMENT | 10m | 最小位移（排除静止场景） |
+| PAST_TIME_HORIZON | 4 s | History time window |
+| FUTURE_TIME_HORIZON | 6 s | Future time window |
+| NUM_PAST_POSES | 40 frames | Number of history trajectory frames |
+| NUM_FUTURE_POSES | 60 frames | Number of future trajectory frames |
+| NUM_AGENTS | 30 | Maximum number of surrounding vehicles |
+| QUERY_RADIUS | 50m | Map lane extraction range |
+| MIN_DISPLACEMENT | 10m | Minimum displacement (excludes stationary scenes) |
 
-## 使用方法
+## Usage
 
-### 1. 处理少量数据（测试）
+### 1. Process a Small Amount of Data (Test)
 
 ```bash
 cd /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans/diffusion_danger_model
 python process_pittsburgh.py --max 100
 ```
 
-### 2. 处理全部数据
+### 2. Process All Data
 
 ```bash
 python process_pittsburgh.py
 ```
 
-### 3. 自定义输出目录
+### 3. Custom Output Directory
 
 ```bash
 python process_pittsburgh.py --output /path/to/output --max 10000
 ```
 
-## 输出数据格式
+## Output Data Format
 
-每个 `features_*.pkl` 文件包含：
+Each `features_*.pkl` file contains:
 
-| 字段 | 形状 | 说明 |
+| Field | Shape | Description |
 |------|------|------|
-| POLYLINE_FEATURES | (N, 12) | 12维特征向量 |
-| GROUND_TRUTH | (1, 60, 2) | 60帧未来轨迹增量 |
-| TRAJ_ID_TO_INDICES | dict | 轨迹ID到索引映射 |
-| EGO_LAST_POS | [x, y] | Ego绝对位置 |
+| POLYLINE_FEATURES | (N, 12) | 12-dimensional feature vector |
+| GROUND_TRUTH | (1, 60, 2) | 60-frame future trajectory increments |
+| TRAJ_ID_TO_INDICES | dict | Mapping from trajectory ID to indices |
+| EGO_LAST_POS | [x, y] | Ego absolute position |
 
-## 自动生成的处理报告
+## Automatically Generated Processing Report
 
-处理完成后会自动生成 `processing_report_*.md` 报告文件，包含：
+After processing finishes, a `processing_report_*.md` report file is generated automatically, containing:
 
-- **处理配置**：时间窗口、车辆参数、筛选配置
-- **处理结果统计**：成功/失败数量、处理速度、用时
-- **周围车辆数量分布**：车辆数统计和占比
-- **数据格式验证**：字段形状和特征说明
-- **说明**：ID含义、注意事项
+- **Processing configuration**: time windows, vehicle parameters, filtering configuration
+- **Processing result statistics**: success/failure counts, processing speed, time taken
+- **Distribution of surrounding vehicle counts**: vehicle count statistics and shares
+- **Data format validation**: field shapes and feature descriptions
+- **Notes**: ID meanings, caveats
 
-### 查看报告
+### Viewing the Report
 
 ```bash
-# 查看最新生成的报告
+# View the most recently generated report
 cat processed_data/processing_report_*.md | head -100
 ```
 
-## 车辆数量说明
+## Notes on Vehicle Counts
 
-### ID含义
+### ID Meanings
 
-| ID | 类型 | 是否计入统计 |
+| ID | Type | Counted in statistics |
 |----|------|------------|
-| ID=0 | Ego（本车） | ❌ 不计入 |
-| ID>0 + type='agent' | 周围车辆 | ✓ 计入 |
-| ID>0 + type='lane' | 车道 | ❌ 不计入 |
+| ID=0 | Ego (own vehicle) | ❌ Not counted |
+| ID>0 + type='agent' | Surrounding vehicle | ✓ Counted |
+| ID>0 + type='lane' | Lane | ❌ Not counted |
 
-### 注意事项
+### Caveats
 
-1. **车辆数量取决于NuPlan数据本身**，不是危险筛选后的结果
-2. **0辆车场景**：NuPlan数据中该时刻确实无周围车辆
-3. **后续处理**：需要使用 `ttc_filter.py` 进行TTC危险场景筛选
+1. **The vehicle count depends on the NuPlan data itself**, not on the result of danger filtering
+2. **Scenes with 0 vehicles**: the NuPlan data genuinely has no surrounding vehicles at that moment
+3. **Subsequent processing**: `ttc_filter.py` must be used for TTC danger scene filtering
 
-## 后续处理
+## Subsequent Processing
 
-处理完成后，使用 `ttc_filter.py` 进行TTC筛选：
-- 从 processed_data 提取危险场景
-- 生成 danger_pair_scenarios 用于Diffusion训练
+After processing finishes, use `ttc_filter.py` for TTC filtering:
+- Extract danger scenes from processed_data
+- Generate danger_pair_scenarios for Diffusion training

@@ -1,16 +1,16 @@
-# Diffusion 危险场景生成器说明
+# Diffusion Dangerous Scenario Generator
 
-## 文档定位
+## Document Scope
 
-本文档面向需要理解 Diffusion 危险场景生成系统整体设计、核心模块和训练目标的开发者。重点内容是模型结构、条件编码方式以及各组件之间的关系。
+This document is intended for developers who need to understand the overall design, core modules and training objectives of the Diffusion dangerous scenario generation system. It focuses on the model architecture, the condition encoding scheme and the relationships between components.
 
-## 适用范围
+## Applicability
 
-- 阅读和维护 Diffusion 生成相关代码
-- 理解 `SceneConditionEncoder`、`DangerSceneDiffusion` 和训练损失
-- 对接危险评分模块和生成模块
+- Reading and maintaining the Diffusion generation code
+- Understanding `SceneConditionEncoder`, `DangerSceneDiffusion` and the training loss
+- Connecting the danger scoring module with the generation module
 
-## 相关文件
+## Related Files
 
 - `models/scene_condition_encoder.py`
 - `models/danger_diffusion.py`
@@ -18,130 +18,130 @@
 - `train_diffusion_generator.py`
 - `generate_danger_scenes.py`
 
-## 推荐阅读顺序
+## Recommended Reading Order
 
-1. 先阅读本文档，理解模型结构和训练目标
-2. 再阅读 `danger_score_documentation.md`，理解风险信号来源
-3. 最后阅读 `diffusion_usage_guide.md`，按流程运行训练和生成
+1. Read this document first to understand the model architecture and training objectives
+2. Then read `danger_score_documentation.md` to understand where the risk signal comes from
+3. Finally read `diffusion_usage_guide.md` and follow the workflow to run training and generation
 
-## 概述
+## Overview
 
-本文档描述了基于扩散模型（Diffusion Model）的危险场景生成系统，用于生成比 GT（Ground Truth）轨迹更危险的驾驶场景数据。
+This document describes a dangerous scenario generation system based on a diffusion model (Diffusion Model), used to generate driving scenario data that is more dangerous than the GT (Ground Truth) trajectories.
 
-### 目标
+### Goals
 
-- **输入**：历史轨迹 + SVO角度 + danger_target
-- **输出**：生成的未来轨迹（比GT更危险）
-- **用途**：数据增强、风险边界测试、极端场景模拟
+- **Input**: historical trajectories + SVO angle + danger_target
+- **Output**: generated future trajectories (more dangerous than GT)
+- **Uses**: data augmentation, risk boundary testing, extreme scenario simulation
 
-### 训练目标
+### Training Objectives
 
-1. **重建GT轨迹**：学习基本的轨迹生成能力
-2. **Danger超越**：生成轨迹的danger > GT的danger
+1. **Reconstruct the GT trajectory**: learn basic trajectory generation capability
+2. **Danger exceedance**: danger of the generated trajectory > danger of GT
 
 ---
 
-## 系统架构
+## System Architecture
 
-### 整体结构
+### Overall Structure
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│              Diffusion危险场景生成器                          │
+│          Diffusion Dangerous Scenario Generator              │
 ├──────────────────────────────────────────────────────────────┤
 │                                                              │
-│  输入条件                                                     │
-│  ├── 历史轨迹编码 (来自GNN+Trans encoder, 384维)             │
-│  ├── SVO角度条件 (控制行为倾向)                               │
-│  │   - 竞争型(-45°) → 更危险                                  │
-│  │   - 合作型(45°) → 更安全                                   │
-│  └── danger_target (目标危险等级)                             │
-│      - danger_target > GT_danger → 生成更危险轨迹             │
+│  Input conditions                                            │
+│  ├── History encoding (from GNN+Trans encoder, 384-dim)      │
+│  ├── SVO angle condition (controls behavioural tendency)     │
+│  │   - Competitive (-45°) → more dangerous                   │
+│  │   - Cooperative (45°) → safer                             │
+│  └── danger_target (target danger level)                     │
+│      - danger_target > GT_danger → more dangerous trajectory │
 │                                                              │
-│  条件编码器                                                   │
+│  Condition encoder                                           │
 │  ├── SceneConditionEncoder                                   │
-│  ├── 输入: scene_feat(384) + svo_angle + danger              │
-│  └── 输出: 256维条件向量                                      │
+│  ├── Input: scene_feat(384) + svo_angle + danger             │
+│  └── Output: 256-dim condition vector                        │
 │                                                              │
-│  Diffusion生成                                                │
+│  Diffusion generation                                        │
 │  ├── DangerSceneDiffusion (DDPM)                             │
-│  ├── 100步去噪过程                                            │
+│  ├── 100-step denoising process                              │
 │  ├── Transformer-based Denoiser                              │
-│  └── 输出: 轨迹增量序列 (120维 = 60步 × dx,dy)               │
+│  └── Output: trajectory increments (120-dim = 60 steps × dx,dy) │
 │                                                              │
-│  评估                                                         │
-│  ├── compute_danger_score_torch (生成轨迹)                   │
-│  ├── 与GT对比                                                 │
-│  └── 保存为新的训练样本                                        │
+│  Evaluation                                                  │
+│  ├── compute_danger_score_torch (generated trajectory)       │
+│  ├── Comparison with GT                                      │
+│  └── Saved as new training samples                           │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 文件结构
+## File Structure
 
-### 新增文件
+### New Files
 
-| 文件路径 | 功能 |
+| File Path | Function |
 |----------|------|
-| `utils/danger_score_torch.py` | PyTorch版本的danger计算，支持GPU和自动梯度 |
-| `models/scene_condition_encoder.py` | 条件编码器（场景+SVO+Danger） |
-| `models/danger_diffusion.py` | Diffusion生成器（DDPM） |
-| `train_diffusion_generator.py` | 训练脚本 |
-| `generate_danger_scenes.py` | 生成脚本 |
+| `utils/danger_score_torch.py` | PyTorch version of the danger computation, supporting GPU and autograd |
+| `models/scene_condition_encoder.py` | Condition encoder (scene + SVO + Danger) |
+| `models/danger_diffusion.py` | Diffusion generator (DDPM) |
+| `train_diffusion_generator.py` | Training script |
+| `generate_danger_scenes.py` | Generation script |
 
-### 修改文件
+### Modified Files
 
-| 文件路径 | 修改内容 |
+| File Path | Modification |
 |----------|----------|
-| `models/transformer_predictor.py` | 添加 `get_encoder_features()` 方法 |
+| `models/transformer_predictor.py` | Added the `get_encoder_features()` method |
 
 ---
 
-## 核心组件详解
+## Core Components in Detail
 
 ### 1. danger_score_torch.py
 
-PyTorch版本的danger计算模块，用于Diffusion训练中的loss计算。
+PyTorch version of the danger computation module, used for loss computation in Diffusion training.
 
-#### 主要函数
+#### Main Functions
 
 ```python
-# 计算单段轨迹的危险指数
+# Compute the danger index of a single trajectory segment
 compute_single_trajectory_danger_torch(ego_traj, agent_traj, config)
 
-# 主危险评分函数
+# Main danger scoring function
 compute_danger_score_torch(ego_history, ego_future, agent_history, agent_future)
 
-# 从轨迹增量恢复完整轨迹
+# Recover the full trajectory from trajectory increments
 recover_trajectory_from_increment(increments, last_pos, last_heading, last_vx, last_vy)
 
-# 计算轨迹平滑度loss
+# Compute the trajectory smoothness loss
 trajectory_smoothness_loss_torch(increments)
 ```
 
 #### DangerExceedLoss
 
-核心训练Loss类：
+Core training loss class:
 
 ```python
 class DangerExceedLoss(nn.Module):
     """
-    Loss组成：
+    Loss components:
     1. reconstruction_loss: MSE(pred_traj, gt_traj)
     2. danger_exceed_loss: ReLU(gt_danger - pred_danger + margin)
-    3. smoothness_loss: 加速度平方和
+    3. smoothness_loss: sum of squared accelerations
     """
     
     def forward(self, pred_increments, gt_increments, ...):
-        # 重建Loss
+        # Reconstruction loss
         recon_loss = F.mse_loss(pred_increments, gt_increments)
         
-        # Danger超越Loss
+        # Danger exceedance loss
         danger_exceed_loss = F.relu(gt_danger + margin - pred_danger)
         
-        # 平滑Loss
+        # Smoothness loss
         smoothness_loss = trajectory_smoothness_loss_torch(pred_increments)
         
         return total_loss, loss_dict
@@ -149,68 +149,68 @@ class DangerExceedLoss(nn.Module):
 
 ### 2. scene_condition_encoder.py
 
-将多种条件融合为统一的256维条件向量。
+Fuses multiple conditions into a single 256-dimensional condition vector.
 
 #### SceneConditionEncoder
 
 ```python
 class SceneConditionEncoder(nn.Module):
     """
-    输入：
-    - scene_feat: [batch, 384] 来自GNN+Trans encoder
-    - svo_angle: [batch, 1] SVO角度（度）
-    - inherent_danger: [batch, 1] 历史风险
-    - danger_target: [batch, 1] 目标风险
+    Inputs:
+    - scene_feat: [batch, 384] from the GNN+Trans encoder
+    - svo_angle: [batch, 1] SVO angle (degrees)
+    - inherent_danger: [batch, 1] historical risk
+    - danger_target: [batch, 1] target risk
     
-    输出：
-    - condition: [batch, 256] 条件向量
+    Output:
+    - condition: [batch, 256] condition vector
     """
     
     def __init__(self, config):
-        # 场景编码器：384 -> 256
+        # Scene encoder: 384 -> 256
         self.scene_encoder = nn.Sequential(...)
         
-        # SVO角度编码器：1 -> 64
+        # SVO angle encoder: 1 -> 64
         self.svo_encoder = nn.Sequential(...)
         
-        # Danger编码器：2 -> 64
+        # Danger encoder: 2 -> 64
         self.danger_encoder = nn.Sequential(...)
         
-        # 条件融合层
+        # Condition fusion layer
         self.condition_fusion = nn.Linear(384, 256)
 ```
 
 #### SimpleSceneEncoder
 
-当GNN+Trans encoder不可用时，直接从历史轨迹提取特征：
+When the GNN+Trans encoder is unavailable, features are extracted directly from the historical trajectories:
 
 ```python
 class SimpleSceneEncoder(nn.Module):
     """
-    输入：
+    Inputs:
     - ego_history: [batch, T_hist, 5]
     - agent_history: [batch, T_hist, 5]
     
-    输出：
+    Output:
     - scene_feat: [batch, 384]
     """
 ```
 
 ### 3. danger_diffusion.py
 
-基于DDPM的去噪扩散模型。
+A denoising diffusion model based on DDPM.
 
 #### DiffusionConfig
 
 ```python
 @dataclass
 class DiffusionConfig:
-    condition_dim: int = 256        # 条件向量维度
-    trajectory_dim: int = 120       # 轨迹维度 (60步 × 2)
-    num_diffusion_steps: int = 100  # 去噪步数
-    beta_schedule: str = 'linear'   # beta调度类型
-    denoiser_num_layers: int = 4    # Transformer层数
-    condition_injection: str = 'cross_attention'  # 条件注入方式
+    condition_dim: int = 256        # Condition vector dimension
+    trajectory_dim: int = 120       # Trajectory dimension (60 steps × 2)
+    num_diffusion_steps: int = 100  # Number of denoising steps
+    beta_schedule: str = 'linear'   # Beta schedule type
+    denoiser_num_layers: int = 4    # Number of Transformer layers
+    condition_injection: str = 'cross_attention'  # Condition injection method
 ```
 
 #### DangerSceneDiffusion
@@ -218,59 +218,59 @@ class DiffusionConfig:
 ```python
 class DangerSceneDiffusion(nn.Module):
     """
-    训练流程：
-    1. 随机采样时间步 t
-    2. 添加噪声：x_t = sqrt(alpha_bar) * x_0 + sqrt(1-alpha_bar) * noise
-    3. 预测噪声：noise_pred = denoiser(x_t, condition, t)
-    4. 计算loss：MSE(noise_pred, noise)
+    Training procedure:
+    1. Randomly sample a timestep t
+    2. Add noise: x_t = sqrt(alpha_bar) * x_0 + sqrt(1-alpha_bar) * noise
+    3. Predict the noise: noise_pred = denoiser(x_t, condition, t)
+    4. Compute the loss: MSE(noise_pred, noise)
     
-    生成流程：
-    1. 初始化纯噪声 x_T
-    2. 逐步去噪：从T到1
-    3. 得到 x_0（生成的轨迹增量）
+    Generation procedure:
+    1. Initialise pure noise x_T
+    2. Denoise step by step: from T to 1
+    3. Obtain x_0 (the generated trajectory increments)
     """
     
     def add_noise(self, x_0, t):
-        """添加噪声（前向扩散）"""
+        """Add noise (forward diffusion)"""
         
     def denoise_step(self, x_t, condition, t):
-        """单步去噪"""
+        """Single denoising step"""
         
     def generate(self, condition, num_samples=1):
-        """从噪声生成轨迹"""
+        """Generate trajectories from noise"""
 ```
 
 #### TrajectoryDenoiser
 
-Transformer-based去噪网络：
+Transformer-based denoising network:
 
 ```python
 class TrajectoryDenoiser(nn.Module):
     """
-    支持三种条件注入方式：
-    1. cross_attention: 使用cross-attention融合条件
-    2. concat: 拼接条件到输入
-    3. addition: 直接加法融合
+    Supports three condition injection methods:
+    1. cross_attention: fuse the condition via cross-attention
+    2. concat: concatenate the condition to the input
+    3. addition: fuse by direct addition
     """
 ```
 
 ---
 
-## SVO角度与行为倾向
+## SVO Angle and Behavioural Tendency
 
-### SVO角度范围
+### SVO Angle Ranges
 
-| 角度范围 | 类型 | 行为倾向 | 生成效果 |
+| Angle Range | Type | Behavioural Tendency | Generation Effect |
 |----------|------|----------|----------|
-| -45° ~ -15° | competitive | 竞争型 | 更危险轨迹 |
-| -15° ~ 22.5° | individualistic | 个人主义 | 中等风险 |
-| 22.5° ~ 57.5° | prosocial | 合作型 | 较安全轨迹 |
-| 57.5° ~ 135° | altruistic | 利他型 | 最安全轨迹 |
+| -45° ~ -15° | competitive | Competitive | More dangerous trajectories |
+| -15° ~ 22.5° | individualistic | Individualistic | Medium risk |
+| 22.5° ~ 57.5° | prosocial | Cooperative | Relatively safe trajectories |
+| 57.5° ~ 135° | altruistic | Altruistic | Safest trajectories |
 
-### 单位圆模型
+### Unit Circle Model
 
 ```
-      y (集体权重)
+      y (collective weight)
       ↑
       │    altruistic (135°)
       │      ●
@@ -278,7 +278,7 @@ class TrajectoryDenoiser(nn.Module):
       │  prosocial (45°)
       │    ●
       │
-──────┼──────────────→ x (个人权重)
+──────┼──────────────→ x (individual weight)
       │
       │  individualistic (0°)
       │    ●
@@ -287,26 +287,26 @@ class TrajectoryDenoiser(nn.Module):
       │      ●
 ```
 
-在单位圆上：
-- x = cos(θ)：个人权重
-- y = sin(θ)：集体权重
-- θ = arctan2(y, x)：SVO角度
+On the unit circle:
+- x = cos(θ): individual weight
+- y = sin(θ): collective weight
+- θ = arctan2(y, x): SVO angle
 
 ---
 
-## 数据流
+## Data Flow
 
-### 训练数据流
+### Training Data Flow
 
 ```
 danger_pair_*.pkl
     │
-    ├── 提取数据
-    │   ├── ego_history, agent_history (历史轨迹)
-    │   ├── ego_future_gt, agent_future_gt (GT未来轨迹)
-    │   ├── svo_angle (计算得到)
-    │   ├── inherent_danger (历史风险)
-    │   ├── gt_danger (GT未来风险)
+    ├── Data extraction
+    │   ├── ego_history, agent_history (historical trajectories)
+    │   ├── ego_future_gt, agent_future_gt (GT future trajectories)
+    │   ├── svo_angle (computed)
+    │   ├── inherent_danger (historical risk)
+    │   ├── gt_danger (GT future risk)
     │   └── danger_target = gt_danger + margin
     │
     ├── SceneEncoder
@@ -315,78 +315,78 @@ danger_pair_*.pkl
     ├── ConditionEncoder
     │   └── condition = encoder(scene_feat, svo, danger)
     │
-    ├── Diffusion训练
+    ├── Diffusion training
     │   ├── add_noise(gt_increments, t)
     │   ├── denoiser(noisy_traj, condition, t)
     │   └── compute_loss(pred, gt, danger)
     │
-    └── 优化
+    └── Optimisation
         └── backward(loss)
 ```
 
-### 生成数据流
+### Generation Data Flow
 
 ```
-推理生成新危险场景:
+Generating new dangerous scenarios at inference:
 
-1. 加载历史轨迹数据
+1. Load historical trajectory data
    ├── ego_history, agent_history
-   ├── 设定svo_angle（或随机）
-   ├── 计算inherent_danger
-   └── 设定danger_target（高于GT）
+   ├── Set svo_angle (or random)
+   ├── Compute inherent_danger
+   └── Set danger_target (higher than GT)
 
-2. SceneEncoder编码
+2. SceneEncoder encoding
    scene_feat = encoder(ego_history, agent_history)
 
-3. ConditionEncoder编码
+3. ConditionEncoder encoding
    condition = encoder(scene_feat, svo, danger)
 
-4. Diffusion生成
+4. Diffusion generation
    pred_increments = diffusion.generate(condition)
 
-5. 恢复轨迹
+5. Trajectory recovery
    pred_trajectory = recover_from_increment(pred_increments)
 
-6. 评估生成结果
+6. Evaluate the generated result
    pred_danger = compute_danger_score(pred_trajectory)
    assert pred_danger > gt_danger
 
-7. 保存为新训练样本
+7. Save as a new training sample
    save_generated_sample(pred_trajectory, ...)
 ```
 
 ---
 
-## 使用方法
+## Usage
 
-### 训练
+### Training
 
 ```bash
-# 基本训练
+# Basic training
 python train_diffusion_generator.py \
     --data_dir danger_pair_scenarios \
     --epochs 100 \
     --batch_size 8 \
     --lr 1e-4
 
-# 调试模式（限制样本数）
+# Debug mode (limited number of samples)
 python train_diffusion_generator.py \
     --data_dir danger_pair_scenarios \
     --epochs 10 \
     --max_samples 50
 ```
 
-### 生成
+### Generation
 
 ```bash
-# 批量生成
+# Batch generation
 python generate_danger_scenes.py \
     --model_path diffusion_training/best_model.pt \
     --data_dir danger_pair_scenarios \
     --output_dir generated_danger_scenes \
     --num_samples 3
 
-# 单场景测试
+# Single-scenario test
 python generate_danger_scenes.py \
     --mode single \
     --model_path diffusion_training/best_model.pt \
@@ -397,11 +397,11 @@ python generate_danger_scenes.py \
 
 ---
 
-## 验证方法
+## Verification
 
-### 1. 训练验证
+### 1. Training Verification
 
-观察训练日志中的loss下降趋势：
+Observe the downward trend of the loss in the training log:
 
 ```
 Epoch 1: loss = 0.5234
@@ -410,167 +410,167 @@ Epoch 50: loss = 0.0843
 Epoch 100: loss = 0.0234
 ```
 
-关键指标：
-- `danger_margin_met`: danger超越成功率
+Key metric:
+- `danger_margin_met`: danger exceedance success rate
 
-### 2. 生成验证
+### 2. Generation Verification
 
-检查生成的轨迹是否比GT更危险：
+Check whether the generated trajectories are more dangerous than GT:
 
 ```python
-# 加载训练好的模型
+# Load the trained model
 generator = DangerSceneGenerator('best_model.pt')
 
-# 生成危险场景
+# Generate a dangerous scenario
 result = generator.generate_from_pkl(
     pkl_path,
-    svo_angle_override=-30,  # 竞争型
+    svo_angle_override=-30,  # competitive
     danger_target_override=gt_danger + 3.0
 )
 
-# 检查danger是否超越
+# Check whether danger is exceeded
 print(f"Generated danger: {result['generated_danger']:.2f}")
 print(f"GT danger: {result['gt_danger']:.2f}")
 print(f"Exceeded: {result['danger_exceeded']}")
 ```
 
-### 3. 数据增强效果
+### 3. Data Augmentation Effect
 
-将生成的危险场景与原始数据混合训练：
+Train on the generated dangerous scenarios mixed with the original data:
 
 ```python
-# 原始数据：N个场景
+# Original data: N scenarios
 original_data = load_danger_pair_data('danger_pair_scenarios')
 
-# 生成数据：M个更危险场景
+# Generated data: M more dangerous scenarios
 generated_data = load_generated_data('generated_danger_scenes')
 
-# 混合训练
+# Mixed training
 mixed_data = original_data + generated_data
 train_prediction_model(mixed_data)
 ```
 
 ---
 
-## 配置参数说明
+## Configuration Parameters
 
 ### DiffusionConfig
 
-| 参数 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |------|--------|------|
-| condition_dim | 256 | 条件向量维度 |
-| trajectory_dim | 120 | 轨迹维度（60步×2） |
-| num_diffusion_steps | 100 | 去噪步数 |
-| beta_start | 1e-4 | beta起始值 |
-| beta_end | 0.02 | beta结束值 |
-| beta_schedule | 'linear' | beta调度类型 |
-| denoiser_num_layers | 4 | Transformer层数 |
-| denoiser_num_heads | 8 | Transformer头数 |
+| condition_dim | 256 | Condition vector dimension |
+| trajectory_dim | 120 | Trajectory dimension (60 steps × 2) |
+| num_diffusion_steps | 100 | Number of denoising steps |
+| beta_start | 1e-4 | Beta start value |
+| beta_end | 0.02 | Beta end value |
+| beta_schedule | 'linear' | Beta schedule type |
+| denoiser_num_layers | 4 | Number of Transformer layers |
+| denoiser_num_heads | 8 | Number of Transformer heads |
 
 ### ConditionEncoderConfig
 
-| 参数 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |------|--------|------|
-| scene_feat_dim | 384 | 场景特征维度 |
-| condition_dim | 256 | 输出条件维度 |
-| svo_embed_dim | 64 | SVO嵌入维度 |
-| danger_embed_dim | 64 | Danger嵌入维度 |
+| scene_feat_dim | 384 | Scene feature dimension |
+| condition_dim | 256 | Output condition dimension |
+| svo_embed_dim | 64 | SVO embedding dimension |
+| danger_embed_dim | 64 | Danger embedding dimension |
 
-### DangerExceedLoss权重
+### DangerExceedLoss Weights
 
-| 参数 | 默认值 | 说明 |
+| Parameter | Default | Description |
 |------|--------|------|
-| recon_weight | 1.0 | 重建Loss权重 |
-| danger_weight | 2.0 | Danger超越Loss权重 |
-| smoothness_weight | 0.3 | 平滑Loss权重 |
-| danger_margin | 0.5 | Danger超越阈值 |
+| recon_weight | 1.0 | Reconstruction loss weight |
+| danger_weight | 2.0 | Danger exceedance loss weight |
+| smoothness_weight | 0.3 | Smoothness loss weight |
+| danger_margin | 0.5 | Danger exceedance threshold |
 
 ---
 
-## 注意事项
+## Notes
 
-### 1. 数据格式要求
+### 1. Data Format Requirements
 
-输入的pkl文件需包含以下字段：
+The input pkl files must contain the following fields:
 - `ego_history`: (T_hist, 5) - [x, y, heading, vx, vy]
 - `key_agent_history`: (T_hist, 5)
-- `ego_future_gt`: (T_future, 2) 或 (1, T_future, 2)
-- `key_agent_future`: (T_future, 3) 或 None
+- `ego_future_gt`: (T_future, 2) or (1, T_future, 2)
+- `key_agent_future`: (T_future, 3) or None
 
-### 2. SVO角度范围
+### 2. SVO Angle Range
 
-- 有效范围：[-45°, 135°]
-- 超出范围会被clamp
+- Valid range: [-45°, 135°]
+- Values outside the range are clamped
 
-### 3. Danger值尺度
+### 3. Danger Value Scale
 
-- 建议danger值在0-50范围内
-- 归一化处理会将值映射到[0, 1]
+- Danger values are recommended to lie in the range 0-50
+- Normalisation maps values to [0, 1]
 
-### 4. GPU内存
+### 4. GPU Memory
 
-- batch_size=8 需约4GB显存
-- 可根据GPU调整batch_size
+- batch_size=8 requires about 4GB of GPU memory
+- batch_size can be adjusted according to the GPU
 
 ---
 
-## 与现有系统集成
+## Integration with the Existing System
 
 ### GNN+Transformer Encoder
 
-修改后的 `transformer_predictor.py` 提供新方法：
+The modified `transformer_predictor.py` provides a new method:
 
 ```python
 class TransformerPredictor(nn.Module):
     def get_encoder_features(self, data) -> torch.Tensor:
         """
-        提取encoder特征用于Diffusion
+        Extract encoder features for Diffusion
         
         Returns:
-            [batch, 384] encoder特征向量
+            [batch, 384] encoder feature vector
             = ego_feat(128) + context_feat(128) + gnn_feat(128)
         """
 ```
 
-### Danger Score系统
+### Danger Score System
 
-与现有的 `danger_score.py` 系统兼容：
-- numpy版本：用于预处理和评估
-- PyTorch版本：用于训练loss计算
+Compatible with the existing `danger_score.py` system:
+- numpy version: used for preprocessing and evaluation
+- PyTorch version: used for training loss computation
 
 ---
 
-## 未来扩展
+## Future Extensions
 
-### 1. 多Agent生成
+### 1. Multi-Agent Generation
 
-`MultiAgentConditionEncoder` 支持多Agent条件编码：
+`MultiAgentConditionEncoder` supports multi-agent condition encoding:
 
 ```python
 encoder = MultiAgentConditionEncoder(max_agents=5)
 condition = encoder(scene_feat, svo_angles, dangers, agent_mask)
 ```
 
-### 2. 自适应Danger目标
+### 2. Adaptive Danger Target
 
-可根据历史风险自动调整目标：
+The target can be adjusted automatically based on the historical risk:
 
 ```python
-danger_target = inherent_danger * 1.5  # 基于历史风险
+danger_target = inherent_danger * 1.5  # based on historical risk
 ```
 
-### 3. 条件引导采样
+### 3. Condition-Guided Sampling
 
-使用classifier-free guidance增强条件控制：
+Use classifier-free guidance to strengthen conditional control:
 
 ```python
-# 无条件和有条件生成混合
+# Mix unconditional and conditional generation
 trajectory = (1 + guidance_scale) * conditional_gen - guidance_scale * unconditional_gen
 ```
 
 ---
 
-## 参考文献
+## References
 
 1. **DDPM**: Ho et al., "Denoising Diffusion Probabilistic Models", NeurIPS 2020
 2. **Improved DDPM**: Nichol & Dhariwal, "Improved Denoising Diffusion Probabilistic Models", ICML 2021
@@ -578,12 +578,6 @@ trajectory = (1 + guidance_scale) * conditional_gen - guidance_scale * unconditi
 
 ---
 
-## 更新日志
+## Changelog
 
-- 2026-04-10: 初版完成，包含完整的训练和生成系统
-
----
-
-## 作者
-
-Claude Code 辅助生成
+- 2026-04-10: First version completed, including the full training and generation system

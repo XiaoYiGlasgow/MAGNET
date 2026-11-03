@@ -1,222 +1,222 @@
-# Diffusion危险场景生成器 - 项目总结报告
+# Diffusion Danger Scene Generator - Project Summary Report
 
-**生成时间**: 2026-04-14
-
----
-
-## 项目概述
-
-本项目旨在为Diffusion危险场景生成器准备训练数据，通过重新处理NuPlan Pittsburgh数据集，使用新的时间窗口配置（4秒历史 + 6秒未来），并进行TTC（Time To Collision）危险场景筛选。
+**Generated**: 2026-04-14
 
 ---
 
-## 1. 数据处理阶段
+## Project Overview
 
-### 1.1 处理配置
+This project prepares training data for the Diffusion danger scene generator by reprocessing the NuPlan Pittsburgh dataset with a new time-window configuration (4 seconds of history + 6 seconds of future) and applying TTC (Time To Collision) danger scene filtering.
 
-| 参数 | 值 | 说明 |
+---
+
+## 1. Data Processing Stage
+
+### 1.1 Processing Configuration
+
+| Parameter | Value | Description |
 |------|---|------|
-| 数据源 | Pittsburgh | NuPlan训练数据集 |
-| 历史时间窗口 | 4秒 (40帧) | 与原配置(2秒)不同 |
-| 未来时间窗口 | 6秒 (60帧) | 与原配置(8秒)不同 |
-| 帧率 | 10Hz | 采样频率 |
-| 最大周围车辆 | 30辆 | NUM_AGENTS上限 |
-| 地图提取半径 | 50米 | QUERY_RADIUS |
-| 最小位移筛选 | 10米 | 排除静止场景 |
+| Data source | Pittsburgh | NuPlan training dataset |
+| History time window | 4 s (40 frames) | Differs from the original configuration (2 s) |
+| Future time window | 6 s (60 frames) | Differs from the original configuration (8 s) |
+| Frame rate | 10Hz | Sampling frequency |
+| Maximum surrounding vehicles | 30 vehicles | NUM_AGENTS upper limit |
+| Map extraction radius | 50 m | QUERY_RADIUS |
+| Minimum displacement filter | 10 m | Excludes stationary scenes |
 
-### 1.2 处理结果
+### 1.2 Processing Results
 
-| 指标 | 结果 |
+| Metric | Result |
 |------|------|
-| 成功处理 | **803个场景** |
-| 处理失败 | 0个 |
-| 处理速度 | 258.1场景/分钟 |
-| 总用时 | 3.1分钟 |
+| Successfully processed | **803 scenes** |
+| Failed | 0 |
+| Processing speed | 258.1 scenes/minute |
+| Total time | 3.1 minutes |
 
-### 1.3 周围车辆数量分布
+### 1.3 Distribution of Surrounding Vehicle Counts
 
-| 车辆数 | 场景数 | 占比 |
+| Vehicles | Scenes | Share |
 |--------|--------|------|
-| 0辆 | 163 | 20.3% |
-| 1辆 | 147 | 18.3% |
-| 2辆 | 128 | 15.9% |
-| 3辆 | 105 | 13.1% |
-| 4-5辆 | 118 | 14.7% |
-| 6-10辆 | 115 | 14.3% |
-| 11-16辆 | 31 | 3.9% |
+| 0 vehicles | 163 | 20.3% |
+| 1 vehicle | 147 | 18.3% |
+| 2 vehicles | 128 | 15.9% |
+| 3 vehicles | 105 | 13.1% |
+| 4-5 vehicles | 118 | 14.7% |
+| 6-10 vehicles | 115 | 14.3% |
+| 11-16 vehicles | 31 | 3.9% |
 
-**统计汇总**:
-- 平均周围车辆数: 3.06辆
-- 最少: 0辆，最多: 16辆
-- 有>=3辆车的场景: 365个 (45.5%)
-- 有>=5辆车的场景: 196个 (24.4%)
+**Summary statistics**:
+- Mean number of surrounding vehicles: 3.06
+- Minimum: 0 vehicles, maximum: 16 vehicles
+- Scenes with >=3 vehicles: 365 (45.5%)
+- Scenes with >=5 vehicles: 196 (24.4%)
 
-### 1.4 输出数据格式
+### 1.4 Output Data Format
 
-每个 `features_*.pkl` 文件包含:
+Each `features_*.pkl` file contains:
 
-| 字段 | 形状 | 说明 |
+| Field | Shape | Description |
 |------|------|------|
-| POLYLINE_FEATURES | (N, 12) | 12维特征向量 |
-| GROUND_TRUTH | (1, 60, 2) | 60帧未来轨迹增量 |
-| TRAJ_ID_TO_INDICES | dict | 轨迹ID到索引映射 |
-| EGO_LAST_POS | [x, y] | Ego绝对位置 |
+| POLYLINE_FEATURES | (N, 12) | 12-dimensional feature vector |
+| GROUND_TRUTH | (1, 60, 2) | 60-frame future trajectory increments |
+| TRAJ_ID_TO_INDICES | dict | Mapping from trajectory ID to indices |
+| EGO_LAST_POS | [x, y] | Ego absolute position |
 
-**12维特征向量说明**:
-| 维度 | 字段 | 说明 |
+**12-dimensional feature vector description**:
+| Dimension | Field | Description |
 |------|------|------|
-| 0-1 | x_start, y_start | segment起点坐标 |
-| 2-3 | x_end, y_end | segment终点坐标 |
-| 4 | heading_start | 起点朝向 |
-| 5 | heading_end | 终点朝向 |
-| 6 | normalized_timestamp | 归一化时间戳 |
-| 7-8 | v_start, v_end | 起点/终点速度 |
-| 9 | subgraph_ID | 子图ID |
-| 10-11 | start_time, end_time | 相对时间 |
+| 0-1 | x_start, y_start | Segment start coordinates |
+| 2-3 | x_end, y_end | Segment end coordinates |
+| 4 | heading_start | Start heading |
+| 5 | heading_end | End heading |
+| 6 | normalized_timestamp | Normalised timestamp |
+| 7-8 | v_start, v_end | Start/end speed |
+| 9 | subgraph_ID | Subgraph ID |
+| 10-11 | start_time, end_time | Relative time |
 
 ---
 
-## 2. TTC危险场景筛选阶段
+## 2. TTC Danger Scene Filtering Stage
 
-### 2.1 TTC筛选配置
+### 2.1 TTC Filtering Configuration
 
-| 参数 | 值 | 说明 |
+| Parameter | Value | Description |
 |------|---|------|
-| 纵向TTC阈值 | 5.0秒 | 超过此值无纵向碰撞风险 |
-| 横向TTC阈值 | 2.0秒 | 超过此值无横向碰撞风险 |
-| 考虑车辆尺寸 | False | 使用点模型计算 |
-| 尺寸缓冲区 | 0.5米 | 安全边距 |
+| Longitudinal TTC threshold | 5.0 s | Above this value there is no longitudinal collision risk |
+| Lateral TTC threshold | 2.0 s | Above this value there is no lateral collision risk |
+| Consider vehicle size | False | Computed with a point model |
+| Size buffer | 0.5 m | Safety margin |
 
-### 2.2 TTC筛选结果
+### 2.2 TTC Filtering Results
 
-| 指标 | 结果 |
+| Metric | Result |
 |------|------|
-| 输入场景 | 803个 |
-| 有危险车辆的场景 | **564个** |
-| 筛选成功率 | 70.2% |
-| 原始车辆总数 | 2460辆 |
-| 危险车辆(kept) | **1813辆** |
-| 车辆保留率 | 73.7% |
-| danger_pair保存数 | **564个** |
+| Input scenes | 803 |
+| Scenes with dangerous vehicles | **564** |
+| Filtering success rate | 70.2% |
+| Total original vehicles | 2460 |
+| Dangerous vehicles (kept) | **1813** |
+| Vehicle retention rate | 73.7% |
+| danger_pairs saved | **564** |
 
-### 2.3 选择原因分布
+### 2.3 Distribution of Selection Reasons
 
-| 选择原因 | 场景数 | 占比 |
+| Selection reason | Scenes | Share |
 |---------|--------|------|
 | Front_agent_min_lon_ttc | 229 | 40.6% |
 | Dual_risk_front_agent | 194 | 34.4% |
 | Rear_agent_min_ttc | 141 | 25.0% |
 
-**说明**:
-- `Front_agent_min_lon_ttc`: 前方车辆纵向TTC最小的场景
-- `Dual_risk_front_agent`: 前方车辆同时具有纵向和横向风险
-- `Rear_agent_min_ttc`: 后方车辆TTC最小的场景
+**Notes**:
+- `Front_agent_min_lon_ttc`: scenes where the front vehicle has the minimum longitudinal TTC
+- `Dual_risk_front_agent`: the front vehicle has both longitudinal and lateral risk
+- `Rear_agent_min_ttc`: scenes where the rear vehicle has the minimum TTC
 
-### 2.4 危险车辆数量分布
+### 2.4 Distribution of Dangerous Vehicle Counts
 
-| 危险车辆数 | 场景数 | 占比 |
+| Dangerous vehicles | Scenes | Share |
 |-----------|--------|------|
-| 1辆 | 157 | 27.8% |
-| 2辆 | 146 | 25.9% |
-| 3辆 | 95 | 16.8% |
-| 4-5辆 | 83 | 14.7% |
-| 6-10辆 | 64 | 11.3% |
-| 11-15辆 | 19 | 3.4% |
+| 1 vehicle | 157 | 27.8% |
+| 2 vehicles | 146 | 25.9% |
+| 3 vehicles | 95 | 16.8% |
+| 4-5 vehicles | 83 | 14.7% |
+| 6-10 vehicles | 64 | 11.3% |
+| 11-15 vehicles | 19 | 3.4% |
 
-### 2.5 danger_pair数据格式
+### 2.5 danger_pair Data Format
 
-每个 `danger_pair_features_*.pkl` 文件包含:
+Each `danger_pair_features_*.pkl` file contains:
 
-| 字段 | 形状 | 说明 |
+| Field | Shape | Description |
 |------|------|------|
-| ego_history | (40, 5) | 4秒历史轨迹 |
-| key_agent_history | (40, 5) | 关键危险agent历史轨迹 |
-| ego_future_gt | (60, 5) | 6秒未来轨迹真值 |
-| key_agent_future | (60, 3)或None | agent未来轨迹 |
-| key_agent_lon_ttc | array | 纵向TTC序列 |
-| key_agent_lat_ttc | array | 横向TTC序列 |
-| boundary_agents | list | 其他危险agent列表 |
-| time_window_config | dict | 时间窗口配置 |
+| ego_history | (40, 5) | 4-second history trajectory |
+| key_agent_history | (40, 5) | History trajectory of the key dangerous agent |
+| ego_future_gt | (60, 5) | 6-second future trajectory ground truth |
+| key_agent_future | (60, 3) or None | Agent future trajectory |
+| key_agent_lon_ttc | array | Longitudinal TTC sequence |
+| key_agent_lat_ttc | array | Lateral TTC sequence |
+| boundary_agents | list | List of other dangerous agents |
+| time_window_config | dict | Time-window configuration |
 
 ---
 
-## 3. 文件结构
+## 3. File Structure
 
 ```
 diffusion_danger_model/
-├── config.py                          # 配置文件
-├── process_pittsburgh.py              # 批量处理脚本
-├── processed_data/                    # 原始处理数据
-│   ├── features_*.pkl                 # 803个场景文件
-│   └── processing_report_*.md         # 处理报告
-├── danger_pair_scenarios/             # TTC筛选后的危险场景
-│   ├── danger_pair_features_*.pkl     # 564个危险场景文件
-│   └── ttc_filter_report_*.md         # TTC筛选报告
-└── ttc_filter_results/                # TTC筛选日志
+├── config.py                          # Configuration file
+├── process_pittsburgh.py              # Batch processing script
+├── processed_data/                    # Raw processed data
+│   ├── features_*.pkl                 # 803 scene files
+│   └── processing_report_*.md         # Processing report
+├── danger_pair_scenarios/             # Danger scenes after TTC filtering
+│   ├── danger_pair_features_*.pkl     # 564 danger scene files
+│   └── ttc_filter_report_*.md         # TTC filtering report
+└── ttc_filter_results/                # TTC filtering logs
     └── ttc_filter_batch_*.txt
 ```
 
 ---
 
-## 4. 关键发现
+## 4. Key Findings
 
-### 4.1 数据特点
+### 4.1 Data Characteristics
 
-1. **时间窗口变化**: 从原来的2秒历史+8秒未来改为4秒历史+6秒未来，更适合短期危险场景预测
-2. **车辆分布**: 约20%场景无周围车辆，45%场景有3辆以上车辆
-3. **危险场景比例**: 70%的场景包含至少一个危险车辆（TTC低于阈值）
+1. **Time-window change**: changed from the original 2 s history + 8 s future to 4 s history + 6 s future, which is better suited to short-term danger scene prediction
+2. **Vehicle distribution**: about 20% of scenes have no surrounding vehicles, and 45% of scenes have 3 or more vehicles
+3. **Danger scene proportion**: 70% of scenes contain at least one dangerous vehicle (TTC below threshold)
 
-### 4.2 风险类型分布
+### 4.2 Distribution of Risk Types
 
-- **纵向风险为主**: 40.6%的场景由前方车辆纵向TTC最小触发
-- **双重风险**: 34.4%的场景前方车辆同时存在纵向和横向风险
-- **后方风险**: 25%的场景由后方车辆触发
+- **Mainly longitudinal risk**: 40.6% of scenes are triggered by the minimum longitudinal TTC of the front vehicle
+- **Dual risk**: in 34.4% of scenes the front vehicle has both longitudinal and lateral risk
+- **Rear risk**: 25% of scenes are triggered by the rear vehicle
 
 ---
 
-## 5. 后续使用建议
+## 5. Recommendations for Subsequent Use
 
-### 5.1 Diffusion模型训练
+### 5.1 Diffusion Model Training
 
-筛选后的564个danger_pair数据可直接用于训练:
+The 564 filtered danger_pair samples can be used directly for training:
 
 ```bash
-# 训练命令示例
+# Example training command
 python train_diffusion_generator.py \
     --data_dir diffusion_danger_model/danger_pair_scenarios \
     --epochs 100 \
     --batch_size 32
 ```
 
-### 5.2 数据增强
+### 5.2 Data Augmentation
 
-可通过以下方式扩展数据集:
-- 增加TTC阈值范围（当前仅保留高风险场景）
-- 处理其他NuPlan数据集（如Boston）
-- 调整MIN_DISPLACEMENT获取更多低速场景
+The dataset can be extended in the following ways:
+- Widen the TTC threshold range (currently only high-risk scenes are kept)
+- Process other NuPlan datasets (e.g. Boston)
+- Adjust MIN_DISPLACEMENT to obtain more low-speed scenes
 
 ---
 
-## 6. 代码修复记录
+## 6. Code Fix Record
 
-在项目执行过程中修复了以下问题:
+The following issues were fixed during the project:
 
-| 问题 | 文件 | 解决方案 |
+| Issue | File | Solution |
 |------|------|----------|
-| 函数定义顺序错误 | ttc_filter.py | 将`generate_ttc_report`移到`main()`之前 |
-| f-string语法错误 | 多处 | 修复`print(f'{'='*60}')`格式问题 |
-| 场景类型名称错误 | config.py | 修正`near_multiple_vehicle`为`near_multiple_vehicles` |
+| Wrong function definition order | ttc_filter.py | Moved `generate_ttc_report` before `main()` |
+| f-string syntax error | Multiple places | Fixed the `print(f'{'='*60}')` formatting problem |
+| Wrong scene type name | config.py | Corrected `near_multiple_vehicle` to `near_multiple_vehicles` |
 
 ---
 
-**报告生成完毕**
+**End of report**
 
 ---
 
-## 附录: 相关文件路径
+## Appendix: Related File Paths
 
-- 数据处理脚本: [process_pittsburgh.py](diffusion_danger_model/process_pittsburgh.py)
-- 配置文件: [config.py](diffusion_danger_model/config.py)
-- TTC筛选脚本: [ttc_filter.py](GNN_Trans/utils/ttc_filter.py)
-- 处理报告: [processing_report_20260414_162359.md](diffusion_danger_model/processed_data/processing_report_20260414_162359.md)
-- TTC报告: [ttc_filter_report_20260414_162458.md](diffusion_danger_model/danger_pair_scenarios/ttc_filter_report_20260414_162458.md)
+- Data processing script: [process_pittsburgh.py](diffusion_danger_model/process_pittsburgh.py)
+- Configuration file: [config.py](diffusion_danger_model/config.py)
+- TTC filtering script: [ttc_filter.py](GNN_Trans/utils/ttc_filter.py)
+- Processing report: [processing_report_20260414_162359.md](diffusion_danger_model/processed_data/processing_report_20260414_162359.md)
+- TTC report: [ttc_filter_report_20260414_162458.md](diffusion_danger_model/danger_pair_scenarios/ttc_filter_report_20260414_162458.md)

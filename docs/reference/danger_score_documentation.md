@@ -1,83 +1,83 @@
-# 危险评分模块说明
+# Danger Score Module Description
 
-## 文档定位
+## Purpose of This Document
 
-本文档面向需要理解 `danger_score.py` 设计原理、评分逻辑和接口结构的开发者。重点内容是危险评分模块如何为 Diffusion 危险场景生成提供可解释、可扩展的风险信号。
+This document is intended for developers who need to understand the design principles, scoring logic and interface structure of `danger_score.py`. Its focus is how the danger score module provides an interpretable and extensible risk signal for Diffusion-based danger scenario generation.
 
-## 适用范围
+## Scope
 
-- 阅读和维护 `utils/danger_score.py`
-- 理解 TTC、距离、碰撞、车道关系等评分来源
-- 对接 Diffusion 训练中的 danger 指标
+- Reading and maintaining `utils/danger_score.py`
+- Understanding the scoring sources, such as TTC, distance, collision and lane relationship
+- Interfacing with the danger metric in Diffusion training
 
-## 相关文件
+## Related Files
 
 - `utils/danger_score.py`
 - `utils/danger_score_torch.py`
 - `docs/reference/diffusion_generator_documentation.md`
 - `docs/diffusion_usage_guide.md`
 
-## 推荐阅读顺序
+## Recommended Reading Order
 
-1. 先看本文档，理解危险评分的组成和设计目标
-2. 再看 `diffusion_generator_documentation.md`，理解评分如何接入生成模型
-3. 最后看 `diffusion_usage_guide.md`，按流程运行训练和生成
+1. Read this document first to understand the components and design goals of the danger score
+2. Then read `diffusion_generator_documentation.md` to understand how the score is connected to the generative model
+3. Finally read `diffusion_usage_guide.md` and follow the workflow to run training and generation
 
-## 概述
+## Overview
 
-本文档详细描述了 `danger_score.py` 模块的设计原理、实现细节和使用方法。该模块用于计算自动驾驶场景中 ego 车辆与周围车辆轨迹对的危险评分，为 Diffusion 模型生成危险轨迹提供引导信号。
+This document describes in detail the design principles, implementation details and usage of the `danger_score.py` module. The module computes the danger score of a trajectory pair between the ego vehicle and a surrounding vehicle in autonomous driving scenarios, providing a guidance signal for the Diffusion model to generate dangerous trajectories.
 
 ---
 
-## 一、整体设计思路
+## 1. Overall Design
 
-### 1.1 输入输出
+### 1.1 Inputs and Outputs
 
 ```
-输入:
+Inputs:
 ├── ego_history: np.ndarray, shape=(T_hist, 5)
-│   └── 过去轨迹 [x, y, heading, vx, vy]
+│   └── Past trajectory [x, y, heading, vx, vy]
 ├── ego_future: np.ndarray, shape=(T_future, 5)
-│   └── 未来轨迹（待评估）
+│   └── Future trajectory (to be evaluated)
 ├── agent_history: np.ndarray, shape=(T_hist, 5)
 └── agent_future: np.ndarray, shape=(T_future, 5)
 
-输出:
+Outputs:
 ├── total_score: float
-│   └── 综合危险评分
+│   └── Overall danger score
 ├── component_scores: Dict[str, float]
-│   └── 各组件评分详情
+│   └── Per-component score details
 ├── ttc_info: Dict
-│   └── TTC分析详情
+│   └── TTC analysis details
 ├── collision_info: Dict
-│   └── 碰撞检测详情
+│   └── Collision detection details
 ├── lane_info: Dict
-│   └── 车道关系信息
+│   └── Lane relationship information
 └── danger_level: str
-    └── 危险等级分类
+    └── Danger level classification
 ```
 
-### 1.2 核心思想
+### 1.2 Core Ideas
 
-1. **多维度危险评估**：危险是TTC、距离、速度、车道关系等多因素的综合体现
-2. **车道感知**：不同车道关系的车辆，危险评估逻辑不同
-3. **可微分设计**：评分函数可微分，支持diffusion模型的梯度引导
+1. **Multi-dimensional danger assessment**: danger is the combined effect of multiple factors, including TTC, distance, speed and lane relationship
+2. **Lane awareness**: vehicles with different lane relationships are assessed with different danger logic
+3. **Differentiable design**: the scoring function is differentiable, supporting gradient guidance for the diffusion model
 
-### 1.3 模块结构
+### 1.3 Module Structure
 
 ```
 danger_score.py
-├── 配置类
+├── Configuration class
 │   └── DangerScoreConfig
-├── 车道感知函数
+├── Lane-awareness functions
 │   ├── get_lane_index()
 │   ├── get_lane_relationship()
 │   └── detect_lane_change_intent()
-├── TTC计算函数
+├── TTC computation functions
 │   ├── compute_ttc_1d()
 │   ├── compute_relative_state()
 │   └── compute_ttc_at_timestep()
-├── 危险评分组件
+├── Danger score components
 │   ├── ttc_danger_score()
 │   ├── distance_danger_score()
 │   ├── collision_detection()
@@ -85,64 +85,64 @@ danger_score.py
 │   ├── acceleration_danger_score()
 │   ├── lane_change_conflict_score()
 │   └── compute_lane_aware_ttc_danger()
-├── 主函数
+├── Main functions
 │   ├── compute_danger_score()
 │   └── classify_danger_level()
-└── Diffusion工具函数
+└── Diffusion utility functions
     ├── compute_danger_gradient()
     └── batch_compute_danger_scores()
 ```
 
 ---
 
-## 二、配置参数详解
+## 2. Configuration Parameters in Detail
 
-### 2.1 TTC阈值
+### 2.1 TTC Thresholds
 
 ```python
-ttc_critical: float = 1.0   # 临界TTC（秒）
-ttc_warning: float = 3.0    # 警告TTC（秒）
-ttc_max: float = 10.0       # 最大考虑的TTC（秒）
+ttc_critical: float = 1.0   # Critical TTC (seconds)
+ttc_warning: float = 3.0    # Warning TTC (seconds)
+ttc_max: float = 10.0       # Maximum TTC considered (seconds)
 ```
 
-| 阈值 | 含义 | 评分策略 |
+| Threshold | Meaning | Scoring strategy |
 |------|------|---------|
-| ttc_critical | 1秒内碰撞风险极高 | 评分加倍 |
-| ttc_warning | 3秒内需要关注 | 正常评分 |
-| ttc_max | 超过10秒不考虑 | 评分衰减为0.1x |
+| ttc_critical | Very high collision risk within 1 second | Score doubled |
+| ttc_warning | Requires attention within 3 seconds | Normal score |
+| ttc_max | Not considered beyond 10 seconds | Score attenuated to 0.1x |
 
-### 2.2 距离阈值
+### 2.2 Distance Thresholds
 
 ```python
-min_safe_distance: float = 5.0      # 最小安全距离（米）
-collision_distance: float = 2.0     # 认定为碰撞的距离（米）
-near_miss_distance: float = 3.0     # 近距离阈值（米）
+min_safe_distance: float = 5.0      # Minimum safe distance (metres)
+collision_distance: float = 2.0     # Distance regarded as a collision (metres)
+near_miss_distance: float = 3.0     # Near-distance threshold (metres)
 ```
 
 ```
-距离范围判定:
+Distance range classification:
 
   0m        2m         3m         5m
-   |---------|----------|----------|----------→ 距离
+   |---------|----------|----------|----------→ distance
    collision  near_miss   safe
    
-   评分高     评分中等    评分低/零
+   high score  medium score  low/zero score
 ```
 
-### 2.3 车道参数
+### 2.3 Lane Parameters
 
 ```python
-lane_width: float = 3.5              # 标准车道宽度（米）
-same_lane_threshold: float = 1.75    # 同车道判定阈值（米）
-adjacent_lane_threshold: float = 5.25  # 相邻车道判定阈值（米）
-lane_change_vy_threshold: float = 0.5  # 变道横向速度阈值（米/秒）
+lane_width: float = 3.5              # Standard lane width (metres)
+same_lane_threshold: float = 1.75    # Same-lane threshold (metres)
+adjacent_lane_threshold: float = 5.25  # Adjacent-lane threshold (metres)
+lane_change_vy_threshold: float = 0.5  # Lateral velocity threshold for lane change (metres/second)
 ```
 
-**阈值计算依据**：
+**Basis for the thresholds**:
 - `same_lane_threshold = lane_width / 2 = 1.75m`
 - `adjacent_lane_threshold = lane_width * 1.5 = 5.25m`
 
-### 2.4 权重参数
+### 2.4 Weight Parameters
 
 ```python
 weight_ttc_longitudinal: float = 1.0
@@ -156,53 +156,53 @@ weight_acceleration: float = 0.3
 weight_lane_change_conflict: float = 2.0
 ```
 
-**权重设计原则**：
-- 碰撞权重最高（10.0），因为碰撞是最危险的情况
-- 同车道TTC权重加成（1.5x），因为同车道追尾风险最高
-- 变道冲突权重（2.0），因为变道碰撞难以预测
+**Weight design principles**:
+- The collision weight is the highest (10.0), because a collision is the most dangerous situation
+- Same-lane TTC receives a weight bonus (1.5x), because the rear-end collision risk is highest in the same lane
+- Lane-change conflict weight (2.0), because lane-change collisions are hard to predict
 
 ---
 
-## 三、车道感知系统
+## 3. Lane-Awareness System
 
-### 3.1 坐标系定义
+### 3.1 Coordinate System Definition
 
 ```
-        Y (左)
+        Y (left)
         ↑
         |
-    车道1 | 车道0 | 车道-1
+   lane 1 | lane 0 | lane -1
    (Y>0) | (Y≈0) | (Y<0)
         |       |
-        |  ego  +------→ X (前)
+        |  ego  +------→ X (forward)
         |       |
         |       |
         ↓
-        Y (右)
+        Y (right)
 
-约定：
-- ego所在车道为车道0，Y坐标约等于0
-- 左侧车道Y > 0
-- 右侧车道Y < 0
+Conventions:
+- The ego lane is lane 0, with Y coordinate approximately 0
+- Left lanes have Y > 0
+- Right lanes have Y < 0
 ```
 
-### 3.2 车道索引计算
+### 3.2 Lane Index Computation
 
 ```python
 def get_lane_index(y_position: float, lane_width: float = 3.5) -> int:
     return int(round(y_position / lane_width))
 ```
 
-**示例**：
+**Example**:
 
-| Y坐标 (米) | 车道索引 | 相对位置 |
+| Y coordinate (metres) | Lane index | Relative position |
 |-----------|---------|---------|
-| 0.0 | 0 | 同车道 |
-| 3.5 | 1 | 左侧第一车道 |
-| -3.5 | -1 | 右侧第一车道 |
-| 7.0 | 2 | 左侧第二车道 |
+| 0.0 | 0 | Same lane |
+| 3.5 | 1 | First lane on the left |
+| -3.5 | -1 | First lane on the right |
+| 7.0 | 2 | Second lane on the left |
 
-### 3.3 车道关系判定
+### 3.3 Lane Relationship Classification
 
 ```python
 def get_lane_relationship(ego_y, agent_y, config) -> str:
@@ -217,22 +217,22 @@ def get_lane_relationship(ego_y, agent_y, config) -> str:
         return 'far_left' if rel_y > 0 else 'far_right'
 ```
 
-**判定逻辑图**：
+**Classification logic diagram**:
 
 ```
-相对Y坐标 (米)
+Relative Y coordinate (metres)
      10.5  |  far_left
-      5.25  ├───────────────── 分界线
+      5.25  ├───────────────── boundary
       3.5   |  adjacent_left
-      1.75  ├───────────────── 分界线
-      0.0   |  same_lane      ← ego位置
-     -1.75  ├───────────────── 分界线
+      1.75  ├───────────────── boundary
+      0.0   |  same_lane      ← ego position
+     -1.75  ├───────────────── boundary
      -3.5   |  adjacent_right
-     -5.25  ├───────────────── 分界线
+     -5.25  ├───────────────── boundary
     -10.5   |  far_right
 ```
 
-### 3.4 变道意图检测
+### 3.4 Lane-Change Intent Detection
 
 ```python
 def detect_lane_change_intent(agent_vy, config) -> Tuple[bool, str]:
@@ -244,134 +244,134 @@ def detect_lane_change_intent(agent_vy, config) -> Tuple[bool, str]:
     return True, 'left' if agent_vy > 0 else 'right'
 ```
 
-**物理原理**：
-- 车辆在车道内稳定行驶时，横向速度接近0
-- 横向速度显著（|vy| > 0.5 m/s）表明正在变道
-- 速度符号决定变道方向
+**Physical principle**:
+- When a vehicle drives steadily within its lane, its lateral velocity is close to 0
+- A significant lateral velocity (|vy| > 0.5 m/s) indicates that it is changing lanes
+- The sign of the velocity determines the direction of the lane change
 
-**示例**：
+**Example**:
 
-| 横向速度 vy (m/s) | 是否变道 | 变道方向 |
+| Lateral velocity vy (m/s) | Lane change? | Lane-change direction |
 |------------------|---------|---------|
-| 0.0 | 否 | - |
-| 0.3 | 否 | - |
-| 0.8 | 是 | 左 |
-| -1.0 | 是 | 右 |
+| 0.0 | No | - |
+| 0.3 | No | - |
+| 0.8 | Yes | Left |
+| -1.0 | Yes | Right |
 
 ---
 
-## 四、TTC计算详解
+## 4. TTC Computation in Detail
 
-### 4.1 一维TTC公式
+### 4.1 One-Dimensional TTC Formula
 
 $$TTC = \begin{cases}
 \frac{d}{-v_{rel}} & \text{if } v_{rel} < 0 \\
 \infty & \text{if } v_{rel} \geq 0
 \end{cases}$$
 
-其中：
-- $d$ = 两车间距离（米）
-- $v_{rel}$ = 相对速度（米/秒），负值表示接近
+where:
+- $d$ = distance between the two vehicles (metres)
+- $v_{rel}$ = relative velocity (metres/second); a negative value indicates approach
 
 ```python
 def compute_ttc_1d(distance, relative_velocity, epsilon=1e-6) -> float:
     if relative_velocity >= 0:
-        return np.inf  # 正在远离
+        return np.inf  # Moving apart
     if distance <= 0:
-        return 0.0    # 已经重叠
+        return 0.0    # Already overlapping
     return distance / (-relative_velocity + epsilon)
 ```
 
-### 4.2 纵向TTC计算
+### 4.2 Longitudinal TTC Computation
 
-**场景分析**：
+**Scenario analysis**:
 
 ```
-情况1: Agent在前方 (rel_x > 0)
+Case 1: Agent ahead (rel_x > 0)
 
     ego ────→     ←──── agent
           rel_x
     
-    如果 ego速度 > agent速度 (rel_vx < 0)，则正在接近
+    If ego speed > agent speed (rel_vx < 0), they are approaching
     lon_ttc = rel_x / (-rel_vx)
 
-情况2: Agent在后方 (rel_x < 0)
+Case 2: Agent behind (rel_x < 0)
 
     agent ────→     ←──── ego
               rel_x
     
-    如果 agent速度 > ego速度 (rel_vx > 0)，则正在接近
+    If agent speed > ego speed (rel_vx > 0), they are approaching
     lon_ttc = |rel_x| / rel_vx
 ```
 
-### 4.3 横向TTC计算
+### 4.3 Lateral TTC Computation
 
 ```python
 if rel_state['rel_y'] > 0:
-    # Agent在左侧
+    # Agent on the left
     lat_ttc = compute_ttc_1d(rel_state['rel_y'], rel_state['rel_vy'])
 else:
-    # Agent在右侧
+    # Agent on the right
     lat_ttc = compute_ttc_1d(abs(rel_state['rel_y']), -rel_state['rel_vy'])
 ```
 
-### 4.4 相对状态计算
+### 4.4 Relative State Computation
 
 ```python
 def compute_relative_state(ego_state, agent_state) -> Dict:
-    # 相对位置
-    rel_x = agent_x - ego_x   # 正值 = agent在前
-    rel_y = agent_y - ego_y   # 正值 = agent在左
+    # Relative position
+    rel_x = agent_x - ego_x   # Positive = agent ahead
+    rel_y = agent_y - ego_y   # Positive = agent on the left
 
-    # 相对速度
+    # Relative velocity
     rel_vx = agent_vx - ego_vx
     rel_vy = agent_vy - ego_vy
 
-    # 距离
+    # Distance
     euclidean_dist = np.sqrt(rel_x**2 + rel_y**2)
 ```
 
 ---
 
-## 五、危险评分组件
+## 5. Danger Score Components
 
-### 5.1 组件列表
+### 5.1 Component List
 
-| 组件名 | 计算依据 | 权重 |
+| Component name | Basis of computation | Weight |
 |-------|---------|------|
-| ttc_score | TTC值 | 1.0 |
-| lane_aware_ttc_score | 车道感知TTC | 动态 |
-| distance_score | 最小距离 | 1.5 |
-| collision_score | 碰撞检测 | 10.0 |
-| near_miss_score | 近距离 | 3.0 |
-| velocity_score | 相对速度 | 0.5 |
-| acceleration_score | 加速度 | 0.3 |
-| lane_change_conflict_score | 变道冲突 | 2.0 |
+| ttc_score | TTC value | 1.0 |
+| lane_aware_ttc_score | Lane-aware TTC | Dynamic |
+| distance_score | Minimum distance | 1.5 |
+| collision_score | Collision detection | 10.0 |
+| near_miss_score | Near distance | 3.0 |
+| velocity_score | Relative velocity | 0.5 |
+| acceleration_score | Acceleration | 0.3 |
+| lane_change_conflict_score | Lane-change conflict | 2.0 |
 
-### 5.2 TTC危险评分
+### 5.2 TTC Danger Score
 
 ```python
 def ttc_danger_score(lon_ttc, lat_ttc, config) -> float:
     score = 0.0
 
-    # 纵向TTC
+    # Longitudinal TTC
     if lon_ttc < ttc_critical:
-        score += weight * (ttc_critical - lon_ttc) * 2.0  # 加倍
+        score += weight * (ttc_critical - lon_ttc) * 2.0  # Doubled
     elif lon_ttc < ttc_warning:
         score += weight * (ttc_warning - lon_ttc)
     elif lon_ttc < ttc_max:
-        score += weight * (ttc_max - lon_ttc) * 0.1  # 衰减
+        score += weight * (ttc_max - lon_ttc) * 0.1  # Attenuated
 
-    # 横向TTC（类似逻辑）
+    # Lateral TTC (similar logic)
     ...
 
     return score
 ```
 
-**评分曲线**：
+**Score curve**:
 
 ```
-评分
+Score
   ↑
   │     ╱──────────╲
   │    ╱            ╲
@@ -383,51 +383,51 @@ def ttc_danger_score(lon_ttc, lat_ttc, config) -> float:
     critical warning max
 ```
 
-### 5.3 车道感知TTC评分
+### 5.3 Lane-Aware TTC Score
 
-这是本模块的核心创新，根据车道关系采用不同评分策略：
+This is the core innovation of the module: different scoring strategies are applied according to the lane relationship:
 
 ```python
 def compute_lane_aware_ttc_danger(lon_ttc, lat_ttc, lane_rel, lane_intent, config):
     if lane_rel == 'same_lane':
-        # 同车道：纵向TTC是主要危险
-        # 权重加成1.5x
+        # Same lane: longitudinal TTC is the main danger
+        # Weight bonus of 1.5x
         return longitudinal_danger(lon_ttc) * 1.5
 
     elif lane_rel in ['adjacent_left', 'adjacent_right']:
         if has_lane_change_intent:
-            # 有变道意图：同时考虑纵向和横向TTC
+            # Lane-change intent: consider both longitudinal and lateral TTC
             return longitudinal_danger(lon_ttc) + lateral_danger(lat_ttc) * 2.0
         else:
-            # 无变道意图：不危险
+            # No lane-change intent: not dangerous
             return 0.0
 
     else:  # far_left, far_right
-        # 远端车道：危险很低
+        # Distant lane: very low danger
         return longitudinal_danger(lon_ttc) * 0.3
 ```
 
-**评分策略表**：
+**Scoring strategy table**:
 
-| 车道关系 | 变道意图 | 纵向TTC权重 | 横向TTC权重 | 说明 |
+| Lane relationship | Lane-change intent | Longitudinal TTC weight | Lateral TTC weight | Notes |
 |---------|---------|------------|------------|------|
-| same_lane | - | 1.5 | 0.8 | 同车道追尾风险最高 |
-| adjacent | 无 | 0 | 0 | 相邻车道无干扰 |
-| adjacent | 有 | 1.0 | 2.0 | 变道冲突风险 |
-| far | - | 0.3 | 0.2 | 距离较远风险低 |
+| same_lane | - | 1.5 | 0.8 | Highest rear-end collision risk in the same lane |
+| adjacent | No | 0 | 0 | No interference from the adjacent lane |
+| adjacent | Yes | 1.0 | 2.0 | Lane-change conflict risk |
+| far | - | 0.3 | 0.2 | Low risk at larger distance |
 
-### 5.4 碰撞检测
+### 5.4 Collision Detection
 
 ```python
 def collision_detection(ego_traj, agent_traj, config):
     for t in range(len(ego_traj)):
-        # 欧氏距离
+        # Euclidean distance
         dist = sqrt((ego_x - agent_x)² + (ego_y - agent_y)²)
 
-        # 碰撞阈值（简化模型）
-        # 考虑两车尺寸
+        # Collision threshold (simplified model)
+        # Accounts for the sizes of both vehicles
         threshold = (ego_length + agent_length)/4 + (ego_width + agent_width)/4
-        # = (4.5 + 4.0)/4 + (2.0 + 2.0)/4 = 3.125米
+        # = (4.5 + 4.0)/4 + (2.0 + 2.0)/4 = 3.125 metres
 
         if dist < threshold:
             has_collision = True
@@ -438,7 +438,7 @@ def collision_detection(ego_traj, agent_traj, config):
     return has_collision, min_distance, collision_timestep
 ```
 
-### 5.5 变道冲突检测
+### 5.5 Lane-Change Conflict Detection
 
 ```python
 def lane_change_conflict_score(ego_traj, agent_traj, config):
@@ -446,7 +446,7 @@ def lane_change_conflict_score(ego_traj, agent_traj, config):
         ego_intent, ego_dir = detect_lane_change_intent(ego_vy)
         agent_intent, agent_dir = detect_lane_change_intent(agent_vy)
 
-        # 两车都有变道意图，且方向相反（向同一车道变道）
+        # Both vehicles intend to change lanes, in opposite directions (towards the same lane)
         if ego_intent and agent_intent and ego_dir != agent_dir:
             dist = abs(ego_y - agent_y)
             if dist < adjacent_lane_threshold:
@@ -455,97 +455,97 @@ def lane_change_conflict_score(ego_traj, agent_traj, config):
     return score
 ```
 
-**图示**：
+**Illustration**:
 
 ```
-变道冲突场景:
+Lane-change conflict scenario:
 
-    车道1    |  车道0  |  车道-1
+    lane 1    |  lane 0  |  lane -1
             |         |
     agent → | ← ego   |
             |         |
-            ↓ 变道冲突 ↓
+            ↓ lane-change conflict ↓
 ```
 
 ---
 
-## 六、主函数流程
+## 6. Main Function Workflow
 
-### 6.1 计算流程图
+### 6.1 Computation Flowchart
 
 ```
                     ┌─────────────────┐
-                    │     输入数据     │
-                    │ ego/agent轨迹   │
+                    │   Input data    │
+                    │ ego/agent traj. │
                     └────────┬────────┘
                              ↓
               ┌──────────────┴──────────────┐
-              │       遍历未来轨迹每一帧      │
+              │ Iterate over each future frame │
               └──────────────┬──────────────┘
                              ↓
     ┌────────────────────────┼────────────────────────┐
     ↓                        ↓                        ↓
 ┌─────────┐            ┌─────────┐            ┌─────────┐
-│ TTC计算 │            │车道判定 │            │变道检测 │
+│ TTC comp.│           │ Lane cls.│           │ LC detect│
 └────┬────┘            └────┬────┘            └────┬────┘
      └───────────────────────┼───────────────────────┘
                              ↓
                     ┌─────────────────┐
-                    │   TTC危险评分    │
-                    │ （车道感知版本） │
+                    │ TTC danger score │
+                    │ (lane-aware ver.)│
                     └────────┬────────┘
                              ↓
                     ┌─────────────────┐
-                    │    碰撞检测      │
+                    │ Collision detect │
                     └────────┬────────┘
                              ↓
               ┌──────────────┴──────────────┐
-              │      计算其他组件评分        │
+              │ Compute other component scores │
               │ velocity/acceleration/...  │
               └──────────────┬──────────────┘
                              ↓
                     ┌─────────────────┐
-                    │   加权求和总分   │
+                    │ Weighted sum total │
                     └────────┬────────┘
                              ↓
                     ┌─────────────────┐
-                    │   危险等级分类   │
+                    │ Danger level cls. │
                     └─────────────────┘
 ```
 
-### 6.2 代码结构
+### 6.2 Code Structure
 
 ```python
 def compute_danger_score(ego_history, ego_future, agent_history, agent_future, config, dt, verbose):
-    # 1. 初始化
-    component_scores = {各组件: 0.0}
-    ttc_info = {TTC详情}
-    lane_info = {车道信息}
+    # 1. Initialisation
+    component_scores = {each component: 0.0}
+    ttc_info = {TTC details}
+    lane_info = {lane information}
 
-    # 2. 遍历未来轨迹
+    # 2. Iterate over the future trajectory
     for t in range(len(ego_future)):
-        # 计算该帧的TTC和车道信息
+        # Compute the TTC and lane information for this frame
         ttc_result = compute_ttc_at_timestep(...)
 
-        # 累积TTC评分
+        # Accumulate TTC scores
         component_scores['ttc_score'] += ttc_danger_score(...)
         component_scores['lane_aware_ttc_score'] += compute_lane_aware_ttc_danger(...)
 
-        # 统计车道关系
+        # Record lane relationships
         lane_info['lane_relationships'].append(ttc_result['lane_relationship'])
 
-    # 3. 碰撞检测
+    # 3. Collision detection
     has_collision, min_distance, collision_t = collision_detection(...)
 
-    # 4. 计算其他组件评分
+    # 4. Compute other component scores
     component_scores['velocity_score'] = relative_velocity_danger_score(...)
     component_scores['acceleration_score'] = acceleration_danger_score(...)
     component_scores['lane_change_conflict_score'] = lane_change_conflict_score(...)
 
-    # 5. 计算总分
+    # 5. Compute the total score
     total_score = sum(component_scores.values())
 
-    # 6. 危险等级分类
+    # 6. Danger level classification
     danger_level = classify_danger_level(total_score)
 
     return {
@@ -558,7 +558,7 @@ def compute_danger_score(ego_history, ego_future, agent_history, agent_future, c
     }
 ```
 
-### 6.3 危险等级分类
+### 6.3 Danger Level Classification
 
 ```python
 def classify_danger_level(score, config) -> str:
@@ -576,33 +576,33 @@ def classify_danger_level(score, config) -> str:
 
 ---
 
-## 七、Diffusion引导功能
+## 7. Diffusion Guidance
 
-### 7.1 梯度计算原理
+### 7.1 Gradient Computation Principle
 
-用于classifier guidance，在diffusion采样时引导轨迹向"更危险"方向生成。
+Used for classifier guidance, steering trajectory generation towards a "more dangerous" direction during diffusion sampling.
 
-**数学原理**：
+**Mathematical principle**:
 
 $$x_{t-1} = x_t - \epsilon_\theta(x_t, t) + \lambda \cdot \nabla_{x_t} D(x_t)$$
 
-其中：
-- $\epsilon_\theta$ 是噪声预测网络
-- $D(x_t)$ 是危险评分函数
-- $\lambda$ 是引导强度
-- $\nabla_{x_t} D(x_t)$ 是危险评分对轨迹的梯度
+where:
+- $\epsilon_\theta$ is the noise prediction network
+- $D(x_t)$ is the danger score function
+- $\lambda$ is the guidance strength
+- $\nabla_{x_t} D(x_t)$ is the gradient of the danger score with respect to the trajectory
 
-### 7.2 数值梯度实现
+### 7.2 Numerical Gradient Implementation
 
 ```python
 def compute_danger_gradient(ego_future, agent_future, ego_history, agent_history, config, epsilon=0.1):
-    # 基础评分
+    # Base score
     base_score = compute_danger_score(ego_history, ego_future, agent_history, agent_future)
 
-    # 对ego轨迹每个位置计算梯度
+    # Compute the gradient at each position of the ego trajectory
     for t in range(len(ego_future)):
         for dim in range(2):  # x, y
-            # 前向差分
+            # Forward difference
             ego_perturbed = ego_future.copy()
             ego_perturbed[t, dim] += epsilon
 
@@ -613,15 +613,15 @@ def compute_danger_gradient(ego_future, agent_future, ego_history, agent_history
     return ego_gradient, agent_gradient
 ```
 
-### 7.3 批量计算
+### 7.3 Batch Computation
 
 ```python
 def batch_compute_danger_scores(ego_futures, agent_futures, ego_history, agent_history, config):
     """
-    用于reward-weighted regression:
-    1. 生成多条候选轨迹
-    2. 计算每条轨迹的危险评分
-    3. 用高分轨迹加权更新模型
+    Used for reward-weighted regression:
+    1. Generate multiple candidate trajectories
+    2. Compute the danger score of each trajectory
+    3. Update the model with weighting by high-scoring trajectories
     """
     scores = np.zeros(batch_size)
     for i in range(batch_size):
@@ -631,108 +631,108 @@ def batch_compute_danger_scores(ego_futures, agent_futures, ego_history, agent_h
 
 ---
 
-## 八、测试场景分析
+## 8. Test Scenario Analysis
 
-### 8.1 场景1: 同车道接近
+### 8.1 Scenario 1: Approaching in the Same Lane
 
-**设置**：
+**Setup**:
 ```
-Ego: 前进 10 m/s
-Agent: 前进 8 m/s（在前方20米，同车道）
-```
-
-**结果**：
-```
-纵向TTC: 7.00秒
-横向TTC: inf
-危险评分: 0.38
-危险等级: LOW
-车道关系: same_lane
+Ego: moving forward at 10 m/s
+Agent: moving forward at 8 m/s (20 metres ahead, same lane)
 ```
 
-**分析**：
-- TTC较大（7秒），危险较低
-- 同车道，主要关注纵向TTC
-- 评分主要来自lane_aware_ttc_score
-
-### 8.2 场景2: 碰撞轨迹
-
-**设置**：
+**Results**:
 ```
-Agent速度更慢，最终距离只有0.17米
+Longitudinal TTC: 7.00 seconds
+Lateral TTC: inf
+Danger score: 0.38
+Danger level: LOW
+Lane relationship: same_lane
 ```
 
-**结果**：
+**Analysis**:
+- The TTC is large (7 seconds), so the danger is low
+- Same lane, so the focus is on longitudinal TTC
+- The score comes mainly from lane_aware_ttc_score
+
+### 8.2 Scenario 2: Collision Trajectory
+
+**Setup**:
 ```
-危险评分: 212.49
-危险等级: CRITICAL
-碰撞检测: True
-最小距离: 0.17m
-碰撞时间步: 20
+The agent is slower; the final distance is only 0.17 metres
 ```
 
-**分析**：
-- 碰撞触发collision_score（100分）
-- min_distance触发distance_score（100分）
-- 纵向TTC接近0触发TTC高分
-
-### 8.3 场景3: 相邻车道无变道
-
-**设置**：
+**Results**:
 ```
-Agent在左侧车道（Y=3.5米）
-横向速度 = 0（无变道意图）
+Danger score: 212.49
+Danger level: CRITICAL
+Collision detected: True
+Minimum distance: 0.17m
+Collision timestep: 20
 ```
 
-**结果**：
+**Analysis**:
+- The collision triggers collision_score (100 points)
+- min_distance triggers distance_score (100 points)
+- Longitudinal TTC close to 0 triggers a high TTC score
+
+### 8.3 Scenario 3: Adjacent Lane without Lane Change
+
+**Setup**:
 ```
-危险评分: 0.00
-危险等级: SAFE
-车道关系: adjacent_left
+Agent in the left lane (Y=3.5 metres)
+Lateral velocity = 0 (no lane-change intent)
 ```
 
-**分析**：
-- 相邻车道，无变道意图
-- lane_aware_ttc_score = 0（正确行为）
-- 不同车道的车辆互不影响
-
-### 8.4 场景4: 变道冲突
-
-**设置**：
+**Results**:
 ```
-Agent从左侧车道（Y=3.5米）向右变道
-横向速度 = -0.8 m/s
+Danger score: 0.00
+Danger level: SAFE
+Lane relationship: adjacent_left
 ```
 
-**结果**：
+**Analysis**:
+- Adjacent lane, no lane-change intent
+- lane_aware_ttc_score = 0 (correct behaviour)
+- Vehicles in different lanes do not affect each other
+
+### 8.4 Scenario 4: Lane-Change Conflict
+
+**Setup**:
 ```
-横向TTC: 0.11秒
-危险评分: 0.67
-危险等级: LOW
-主要车道关系: same_lane
+Agent changes lanes to the right from the left lane (Y=3.5 metres)
+Lateral velocity = -0.8 m/s
 ```
 
-**分析**：
-- 检测到变道意图
-- 横向TTC很小（0.11秒）
-- Agent逐渐进入ego车道
+**Results**:
+```
+Lateral TTC: 0.11 seconds
+Danger score: 0.67
+Danger level: LOW
+Main lane relationship: same_lane
+```
+
+**Analysis**:
+- Lane-change intent is detected
+- The lateral TTC is very small (0.11 seconds)
+- The agent gradually enters the ego lane
 
 ---
 
-## 九、使用示例
+## 9. Usage Examples
 
-### 9.1 基本使用
+### 9.1 Basic Usage
 
 ```python
 from danger_score import compute_danger_score, DangerScoreConfig
 
-# 准备数据
+# Prepare data
 ego_history = np.array(...)  # (41, 5)
 ego_future = np.array(...)   # (30, 5)
 agent_history = np.array(...) # (41, 5)
 agent_future = np.array(...)  # (30, 5)
 
-# 计算危险评分
+# Compute the danger score
 config = DangerScoreConfig()
 result = compute_danger_score(
     ego_history, ego_future,
@@ -742,36 +742,36 @@ result = compute_danger_score(
     verbose=True
 )
 
-print(f"危险评分: {result['total_score']}")
-print(f"危险等级: {result['danger_level']}")
+print(f"Danger score: {result['total_score']}")
+print(f"Danger level: {result['danger_level']}")
 ```
 
-### 9.2 自定义配置
+### 9.2 Custom Configuration
 
 ```python
-# 调整阈值和权重
+# Adjust thresholds and weights
 config = DangerScoreConfig(
-    ttc_critical=0.5,           # 更严格的临界TTC
-    lane_change_vy_threshold=0.3,  # 更敏感的变道检测
-    weight_collision=20.0,      # 更高的碰撞权重
-    weight_ttc_same_lane=2.0    # 更高的同车道TTC权重
+    ttc_critical=0.5,           # Stricter critical TTC
+    lane_change_vy_threshold=0.3,  # More sensitive lane-change detection
+    weight_collision=20.0,      # Higher collision weight
+    weight_ttc_same_lane=2.0    # Higher same-lane TTC weight
 )
 ```
 
-### 9.3 Diffusion引导
+### 9.3 Diffusion Guidance
 
 ```python
 from danger_score import compute_danger_gradient
 
-# 在diffusion采样循环中
+# Inside the diffusion sampling loop
 for t in reversed(range(T)):
-    # 预测噪声
+    # Predict noise
     noise_pred = model(x_t, t, condition)
 
-    # 去噪
+    # Denoise
     x_t_minus_1 = denoise_step(x_t, noise_pred, t)
 
-    # 计算危险梯度
+    # Compute the danger gradient
     ego_grad, agent_grad = compute_danger_gradient(
         x_t_minus_1[:30],    # ego future
         x_t_minus_1[30:],    # agent future
@@ -779,87 +779,86 @@ for t in reversed(range(T)):
         agent_history
     )
 
-    # 引导向更危险方向
+    # Guide towards a more dangerous direction
     x_t_minus_1[:30, :, :2] += guidance_scale * ego_grad
     x_t_minus_1[30:, :, :2] += guidance_scale * agent_grad
 ```
 
 ---
 
-## 十、注意事项与局限
+## 10. Notes and Limitations
 
-### 10.1 当前局限
+### 10.1 Current Limitations
 
-1. **简化的碰撞检测**：使用AABB而非OBB，未考虑车辆朝向
-2. **固定的车道宽度**：假设车道宽度为3.5米，实际可能有变化
-3. **无地图集成**：未使用NuPlan地图API确定车道归属
-4. **单agent评估**：当前只评估一个agent对的危险
+1. **Simplified collision detection**: uses AABB rather than OBB, and does not account for vehicle heading
+2. **Fixed lane width**: assumes a lane width of 3.5 metres, which may vary in practice
+3. **No map integration**: the NuPlan map API is not used to determine lane membership
+4. **Single-agent evaluation**: currently only the danger of one agent pair is evaluated
 
-### 10.2 改进方向
+### 10.2 Directions for Improvement
 
-1. **集成地图API**：使用NuPlan地图确定精确的车道归属
-2. **多agent联合评估**：考虑多个agent的联合危险
-3. **动态阈值**：根据场景类型自动调整阈值
-4. **神经网络评分**：用学习的方法替代手工设计的评分函数
+1. **Integrate the map API**: use the NuPlan map to determine precise lane membership
+2. **Joint multi-agent evaluation**: consider the joint danger of multiple agents
+3. **Dynamic thresholds**: adjust thresholds automatically according to scenario type
+4. **Neural network scoring**: replace the hand-designed scoring function with a learned method
 
-### 10.3 性能考虑
+### 10.3 Performance Considerations
 
-- 单次评分计算约1-5ms（取决于轨迹长度）
-- 梯度计算需要额外2*T*D次评分计算
-- 批量计算时建议使用并行化
+- A single score computation takes about 1-5ms (depending on trajectory length)
+- Gradient computation requires an additional 2*T*D score computations
+- Parallelisation is recommended for batch computation
 
 ---
 
-## 十一、参考文献
+## 11. References
 
-1. TTC计算: Hayward, J.C. (1972). "Near miss determination through use of a scale of danger"
+1. TTC computation: Hayward, J.C. (1972). "Near miss determination through use of a scale of danger"
 2. Diffusion Guidance: Dhariwal, P. & Nichol, A. (2021). "Diffusion Models Beat GANs on Image Synthesis"
-3. NuPlan文档: https://nuplan-devkit.readthedocs.io/
+3. NuPlan documentation: https://nuplan-devkit.readthedocs.io/
 
 ---
 
-## 附录A: 参数调优指南
+## Appendix A: Parameter Tuning Guide
 
-### A.1 TTC阈值调优
+### A.1 TTC Threshold Tuning
 
-| 应用场景 | ttc_critical | ttc_warning | ttc_max |
+| Application scenario | ttc_critical | ttc_warning | ttc_max |
 |---------|-------------|-------------|---------|
-| 保守评估 | 2.0 | 5.0 | 15.0 |
-| 标准评估 | 1.0 | 3.0 | 10.0 |
-| 激进评估 | 0.5 | 2.0 | 8.0 |
+| Conservative evaluation | 2.0 | 5.0 | 15.0 |
+| Standard evaluation | 1.0 | 3.0 | 10.0 |
+| Aggressive evaluation | 0.5 | 2.0 | 8.0 |
 
-### A.2 权重调优
+### A.2 Weight Tuning
 
-| 目标 | 调整建议 |
+| Goal | Suggested adjustment |
 |------|---------|
-| 增加碰撞场景 | weight_collision ↑ |
-| 减少误报 | weight_ttc_lateral ↓ |
-| 强调同车道危险 | weight_ttc_same_lane ↑ |
-| 增加变道场景 | weight_lane_change_conflict ↑ |
+| Increase collision scenarios | weight_collision ↑ |
+| Reduce false alarms | weight_ttc_lateral ↓ |
+| Emphasise same-lane danger | weight_ttc_same_lane ↑ |
+| Increase lane-change scenarios | weight_lane_change_conflict ↑ |
 
 ---
 
-## 附录B: 常见问题
+## Appendix B: Frequently Asked Questions
 
-**Q1: 为什么相邻车道无变道时评分为0？**
+**Q1: Why is the score 0 in an adjacent lane without a lane change?**
 
-A: 这是设计意图。相邻车道的车辆如果保持车道，不会对ego造成威胁，因此危险评分应该为0。
+A: This is by design. A vehicle in an adjacent lane that keeps its lane poses no threat to the ego vehicle, so its danger score should be 0.
 
-**Q2: 梯度计算为什么这么慢？**
+**Q2: Why is gradient computation so slow?**
 
-A: 数值梯度需要多次计算评分函数。可以考虑：
-- 使用自动微分框架（PyTorch）
-- 减少评估的时间点
-- 使用更大的epsilon（牺牲精度）
+A: The numerical gradient requires the scoring function to be computed many times. Options to consider:
+- Use an automatic differentiation framework (PyTorch)
+- Reduce the number of evaluated time points
+- Use a larger epsilon (at the cost of accuracy)
 
-**Q3: 如何处理多个agent？**
+**Q3: How are multiple agents handled?**
 
-A: 当前设计是评估一个agent对的危险。对于多agent场景，可以：
-- 分别计算每个危险agent的评分，取最大值或加权平均
-- 扩展函数支持多agent联合评估
+A: The current design evaluates the danger of one agent pair. For multi-agent scenarios, one can:
+- Compute the score for each dangerous agent separately and take the maximum or a weighted average
+- Extend the function to support joint multi-agent evaluation
 
 ---
 
-文档版本: 1.0
-最后更新: 2026-04-07
-作者: Claude Code Assistant
+Document version: 1.0
+Last updated: 2026-04-07

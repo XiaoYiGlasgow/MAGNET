@@ -1,75 +1,75 @@
-# 教程 02：轨迹预测
+# Tutorial 02: Trajectory Prediction
 
-本教程介绍如何训练、评估 GNN+Transformer 轨迹预测模型，并在 NuPlan 仿真器中运行。
+This tutorial explains how to train and evaluate the GNN+Transformer trajectory prediction model, and how to run it in the NuPlan simulator.
 
 ---
 
-## 工作目录说明
+## Working Directory
 
 ```bash
-# 大多数训练/评估命令在 GNN_Trans 根目录执行
+# Most training/evaluation commands are run from the GNN_Trans root directory
 cd /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans
 conda activate nuplan
 
-# NuPlan 仿真命令在 nuplan-devkit 根目录执行（有专门说明）
+# NuPlan simulation commands are run from the nuplan-devkit root directory (noted separately where relevant)
 cd /mnt/local/Xiao_Yi/nuplan-devkit
 ```
 
 ---
 
-## 概览：三种模型
+## Overview: Three Models
 
-| 模型 | 入口脚本 | 特点 | 建议用途 |
+| Model | Entry Script | Characteristics | Recommended Use |
 |------|----------|------|----------|
-| **GNN + Transformer** | `train.py` | 完整图神经网络，精度最高 | 主模型 |
-| **Transformer Only** | `train_transformer_only.py` | 去掉 GNN，只用 Transformer | 消融实验 |
-| **LSTM** | `train_lstm.py` | 经典序列模型 | 基线对比 |
+| **GNN + Transformer** | `train.py` | Full graph neural network, highest accuracy | Main model |
+| **Transformer Only** | `train_transformer_only.py` | GNN removed, Transformer only | Ablation study |
+| **LSTM** | `train_lstm.py` | Classic sequence model | Baseline comparison |
 
-已有训练好的 GNN+Transformer 权重：`data/model_weights/best_model.pth`，**可以跳过训练直接评估**。
+Trained GNN+Transformer weights are already available: `data/model_weights/best_model.pth`, **so you can skip training and go straight to evaluation**.
 
 ---
 
-## Step 1：确认训练数据
+## Step 1: Check the Training Data
 
 ```bash
 cd /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans
 ls data/processed_data_by_type/
 ```
 
-输出：
+Output:
 ```
-processed_high_lateral_acceleration     ← 高横向加速度场景
-processed_high_magnitude_speed          ← 高速场景
-processed_medium_magnitude_speed        ← 中速场景（默认训练集）
-processed_near_multiple_vehicles        ← 多车交互场景
-processed_traversing_intersection       ← 路口场景
+processed_high_lateral_acceleration     ← high lateral acceleration scenarios
+processed_high_magnitude_speed          ← high-speed scenarios
+processed_medium_magnitude_speed        ← medium-speed scenarios (default training set)
+processed_near_multiple_vehicles        ← multi-vehicle interaction scenarios
+processed_traversing_intersection       ← intersection scenarios
 ```
 
-查看默认训练集的样本数：
+Check the number of samples in the default training set:
 ```bash
 ls data/processed_data_by_type/processed_medium_magnitude_speed/ | wc -l
-# 输出：20002（约 2 万个场景）
+# Output: 20002 (about 20,000 scenarios)
 ```
 
-每个 `.pkl` 文件是一个独立的驾驶场景，包含 ego 车和周围最多 15 辆车的历史轨迹（过去 4 秒）及地图特征。
+Each `.pkl` file is an independent driving scenario containing the historical trajectories (past 4 seconds) of the ego vehicle and up to 15 surrounding vehicles, together with map features.
 
 ---
 
-## Step 2：（可选）修改训练配置
+## Step 2: (Optional) Modify the Training Configuration
 
-打开 `config.py`，按需修改以下参数：
+Open `config.py` and modify the following parameters as needed:
 
 ```python
-# 换场景类型（默认 medium_magnitude_speed）
+# Change the scenario type (default: medium_magnitude_speed)
 TRAIN_PATH = os.path.join(PROCESSED_DATA_BY_TYPE_DIR, "processed_medium_magnitude_speed")
 TEST_PATH  = os.path.join(PROCESSED_DATA_BY_TYPE_DIR, "processed_medium_magnitude_speed")
 
-# 训练超参数
-EPOCHS        = 100     # 训练轮数（从头训建议 50-100）
-BATCH_SIZE    = 8       # 显存不够就改成 4
-LEARNING_RATE = 1e-3    # 初始学习率
+# Training hyperparameters
+EPOCHS        = 100     # Number of epochs (50-100 recommended when training from scratch)
+BATCH_SIZE    = 8       # Change to 4 if GPU memory is insufficient
+LEARNING_RATE = 1e-3    # Initial learning rate
 
-# 模型结构（一般不用改）
+# Model architecture (usually no need to change)
 EMBED_DIM  = 128
 NUM_LAYERS = 3
 NUM_HEADS  = 8
@@ -77,14 +77,14 @@ NUM_HEADS  = 8
 
 ---
 
-## Step 3：训练 GNN+Transformer 主模型
+## Step 3: Train the Main GNN+Transformer Model
 
 ```bash
 cd /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans
 python train.py
 ```
 
-启动后会出现交互式菜单，选择邻接矩阵配置：
+After launch, an interactive menu appears for selecting the adjacency matrix configuration:
 
 ```
 ============================================================
@@ -99,32 +99,32 @@ SELECT ADJACENCY MATRIX CONFIGURATION
 Select configuration (1-5) [default=1]:
 ```
 
-**直接回车**使用默认配置 1（Full connectivity），适合大多数情况。
+**Press Enter** to use the default configuration 1 (Full connectivity), which suits most cases.
 
-训练过程中的输出示例：
+Example output during training:
 ```
 Epoch [1/100] | Train Loss: 2.3451 | Val Loss: 2.1203 | ADE: 1.8432 | FDE: 3.2105
 Epoch [2/100] | Train Loss: 1.9823 | Val Loss: 1.8341 | ADE: 1.6201 | FDE: 2.8934
 ...
 ```
 
-**ADE**（Average Displacement Error）和 **FDE**（Final Displacement Error）越低越好，单位是米。
+Lower **ADE** (Average Displacement Error) and **FDE** (Final Displacement Error) are better; both are in metres.
 
-训练完成后，权重自动保存到：
+After training, the weights are saved automatically to:
 ```
 data/model_weights/
-└── best_model_<场景类型>_<邻接配置>.pth    ← 验证集最佳
-└── final_model_<场景类型>_<邻接配置>.pth   ← 最终 epoch
+└── best_model_<scenario_type>_<adjacency_config>.pth    ← best on validation set
+└── final_model_<scenario_type>_<adjacency_config>.pth   ← final epoch
 ```
 
-训练记录保存到：
+Training records are saved to:
 ```
-experiments/analysis/training_records/<实验名>/
+experiments/analysis/training_records/<experiment_name>/
 ```
 
 ---
 
-## Step 4：训练 Transformer-Only 基线（消融实验用）
+## Step 4: Train the Transformer-Only Baseline (for Ablation)
 
 ```bash
 python train_transformer_only.py \
@@ -135,7 +135,7 @@ python train_transformer_only.py \
     --device cuda:0
 ```
 
-权重保存到：
+Weights are saved to:
 ```
 experiments/baselines/transformer_only/
 └── best_model_transformer_only.pth
@@ -143,31 +143,31 @@ experiments/baselines/transformer_only/
 
 ---
 
-## Step 5：训练 LSTM 基线
+## Step 5: Train the LSTM Baseline
 
 ```bash
 python train_lstm.py
 ```
 
-同样是交互式启动，直接回车用默认配置即可。权重保存到：
+This also starts interactively; just press Enter to use the default configuration. Weights are saved to:
 ```
 experiments/baselines/lstm/
 ```
 
 ---
 
-## Step 6：NuPlan 规划仿真（最直观的端到端测试）
+## Step 6: NuPlan Planning Simulation (the Most Direct End-to-End Test)
 
-这个测试把训练好的 GNN+Transformer 当作 NuPlan 规划器运行，验证模型在真实仿真环境中是否正常工作。
+This test runs the trained GNN+Transformer as a NuPlan planner, verifying that the model works correctly in a realistic simulation environment.
 
-> **注意**：这个命令必须在 `nuplan-devkit` 根目录执行，不是 GNN_Trans 目录。
+> **Note**: This command must be run from the `nuplan-devkit` root directory, not the GNN_Trans directory.
 
 ```bash
 cd /mnt/local/Xiao_Yi/nuplan-devkit
 python GNN_Trans/run_nuboard_simulation.py --no-nuboard
 ```
 
-成功输出：
+Successful output:
 ```
 ...
 Number of successful simulations: 2
@@ -175,47 +175,47 @@ Number of failed simulations: 0
 Finished running simulation!
 ```
 
-### 可视化仿真结果（NuBoard）
+### Visualising Simulation Results (NuBoard)
 
-如果想在浏览器里看仿真轨迹的可视化，去掉 `--no-nuboard`：
+To view the simulated trajectories in a browser, remove `--no-nuboard`:
 
 ```bash
 cd /mnt/local/Xiao_Yi/nuplan-devkit
 python GNN_Trans/run_nuboard_simulation.py
 ```
 
-然后在浏览器访问 `http://localhost:5006`，可以看到 ego 车的轨迹和周围车辆。
+Then open `http://localhost:5006` in a browser to see the ego vehicle's trajectory and the surrounding vehicles.
 
 ---
 
-## Step 7：评估模型性能（ADE/FDE 指标）
+## Step 7: Evaluate Model Performance (ADE/FDE Metrics)
 
-`run_gnn_manifest_eval.py` 在指定测试集上批量计算 ADE/FDE。
+`run_gnn_manifest_eval.py` computes ADE/FDE in batch on a specified test set.
 
-首先需要准备一个 manifest JSON 文件，记录测试样本列表：
+First, prepare a manifest JSON file listing the test samples:
 
 ```bash
-# 查看是否已有 manifest 文件
+# Check whether a manifest file already exists
 find experiments/ -name "*.json" | head -10
 find data/ -name "manifest*.json" | head -5
 ```
 
-如果没有，可以快速生成一个（用 Python 脚本列出测试目录下的 pkl 文件）：
+If none exists, you can quickly generate one (using a Python script that lists the pkl files in the test directory):
 
 ```python
-# 在 GNN_Trans 目录下运行这段代码生成 manifest
+# Run this code in the GNN_Trans directory to generate the manifest
 import os, json
 data_dir = "data/processed_data_by_type/processed_medium_magnitude_speed"
 files = [f for f in os.listdir(data_dir) if f.endswith('.pkl')]
-# 取后 10% 作为测试集
+# Take the last 10% as the test set
 test_files = files[int(len(files)*0.9):]
 manifest = {"sample_files": test_files}
 with open("data/test_manifest.json", "w") as f:
     json.dump(manifest, f)
-print(f"生成 manifest，共 {len(test_files)} 个测试样本")
+print(f"Generated manifest with {len(test_files)} test samples")
 ```
 
-然后运行评估：
+Then run the evaluation:
 
 ```bash
 cd /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans
@@ -228,73 +228,73 @@ python run_gnn_manifest_eval.py \
     --output_json experiments/analysis/gnn_eval_result.json
 ```
 
-参数说明：
+Parameters:
 
-| 参数 | 说明 |
+| Parameter | Description |
 |------|------|
-| `--model_path` | 模型权重路径 |
-| `--data_dir` | 测试数据目录（pkl 文件所在目录）|
-| `--manifest` | 测试样本列表 JSON |
-| `--adjacency_config` | 邻接矩阵配置（与训练时保持一致）|
-| `--device` | `cpu` 或 `cuda:0` |
-| `--output_json` | 结果保存路径（可选）|
+| `--model_path` | Path to the model weights |
+| `--data_dir` | Test data directory (the directory containing the pkl files) |
+| `--manifest` | JSON list of test samples |
+| `--adjacency_config` | Adjacency matrix configuration (must match the one used in training) |
+| `--device` | `cpu` or `cuda:0` |
+| `--output_json` | Path for saving results (optional) |
 
 ---
 
-## Step 8：评估 LSTM 和 IDM 基线
+## Step 8: Evaluate the LSTM and IDM Baselines
 
 ```bash
-# 评估 LSTM
+# Evaluate LSTM
 python run_lstm_pkl_eval.py
 
-# 评估 IDM（智能驾驶模型，基于规则）
+# Evaluate IDM (Intelligent Driver Model, rule-based)
 python run_idm_pkl_eval.py
 ```
 
 ---
 
-## 常见问题
+## FAQ
 
-### Q: train.py 报 `GraphDataset` import 失败
+### Q: train.py fails to import `GraphDataset`
 
 ```
 ModuleNotFoundError: No module named 'dataset'
 ```
 
-原因：没有在正确的 conda 环境下运行，或 `torch_geometric` 未安装。
+Cause: not running in the correct conda environment, or `torch_geometric` is not installed.
 
-解决：
+Solution:
 ```bash
 conda activate nuplan
 python -c "from torch_geometric.data import Data; print('OK')"
 ```
 
-### Q: 训练很慢
+### Q: Training is slow
 
-- 检查是否用了 GPU：`python -c "import torch; print(torch.cuda.is_available())"`
-- `config.py` 里的 `BATCH_SIZE` 过小会导致 GPU 利用率低，适当增大
+- Check whether the GPU is being used: `python -c "import torch; print(torch.cuda.is_available())"`
+- Too small a `BATCH_SIZE` in `config.py` leads to low GPU utilisation; increase it appropriately
 
-### Q: 训练 loss 不收敛
+### Q: Training loss does not converge
 
-- 降低 `LEARNING_RATE`（从 `1e-3` 改为 `5e-4` 或 `1e-4`）
-- 检查数据路径是否正确：`ls data/processed_data_by_type/processed_medium_magnitude_speed/ | head -5`
+- Lower `LEARNING_RATE` (from `1e-3` to `5e-4` or `1e-4`)
+- Check that the data path is correct: `ls data/processed_data_by_type/processed_medium_magnitude_speed/ | head -5`
 
-### Q: NuPlan 仿真报 Hydra 配置错误
+### Q: NuPlan simulation reports a Hydra configuration error
 
-确认从 `nuplan-devkit` 根目录（而非 `GNN_Trans` 目录）运行：
+Make sure you run from the `nuplan-devkit` root directory (not the `GNN_Trans` directory):
 ```bash
-cd /mnt/local/Xiao_Yi/nuplan-devkit  # ← 必须是这个目录
+cd /mnt/local/Xiao_Yi/nuplan-devkit  # ← must be this directory
 python GNN_Trans/run_nuboard_simulation.py --no-nuboard
 ```
 
 ---
 
-## 参考：各脚本对应的输出目录
+## Reference: Output Directory for Each Script
 
-| 脚本 | 权重/结果保存位置 |
+| Script | Where Weights/Results Are Saved |
 |------|-----------------|
 | `train.py` | `data/model_weights/` + `experiments/analysis/training_records/` |
 | `train_transformer_only.py` | `experiments/baselines/transformer_only/` |
 | `train_lstm.py` | `experiments/baselines/lstm/` |
-| `run_gnn_manifest_eval.py` | `--output_json` 指定路径 |
+| `run_gnn_manifest_eval.py` | Path specified by `--output_json` |
 | `run_nuboard_simulation.py` | `/mnt/local/Xiao_Yi/gnn_trans_simulation_results/` |

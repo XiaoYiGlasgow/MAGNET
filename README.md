@@ -25,8 +25,11 @@ red and surrounding vehicles in green; each black line is an agent-to-ego edge w
 give the vehicle-to-vehicle weight assigned by the learned edge scorer. The weights change as the
 scene evolves.
 
-- [Example 1](docs/media/magnet_edge_weights_example1.mp4)
-- [Example 2](docs/media/magnet_edge_weights_example2.mp4)
+| Example 1 | Example 2 |
+|---|---|
+| [![Example 1](docs/media/magnet_edge_weights_example1.gif)](docs/media/magnet_edge_weights_example1.mp4) | [![Example 2](docs/media/magnet_edge_weights_example2.gif)](docs/media/magnet_edge_weights_example2.mp4) |
+
+Click an animation to open the full-resolution video.
 
 ## What is in this release
 

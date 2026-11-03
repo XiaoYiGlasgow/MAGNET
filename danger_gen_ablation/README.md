@@ -1,70 +1,70 @@
-# 危险场景生成 — 消融实验
+# Danger Scenario Generation — Ablation Experiments
 
-本目录包含危险场景生成系统（Diffusion + GNN+Trans）的全部消融实验代码。
-与根目录的主体脚本完全隔离，不影响现有代码运行。
+This directory contains all the ablation experiment code for the danger scenario generation system (Diffusion + GNN+Trans).
+It is fully isolated from the main scripts in the root directory and does not affect how the existing code runs.
 
-## 消融组
+## Ablation groups
 
-| 编号 | 名称 | 对比点 | 需重新训练 |
+| ID | Name | Comparison | Requires retraining |
 |------|------|--------|-----------|
-| A1 | `no_danger_loss` | 去掉 DangerExceedLoss，验证危险监督的必要性 | ✅ |
-| A2 | `no_svo` | SVO 输入置零，验证行为意图条件的有效性 | ✅ |
-| A3 | `no_gnn` | GNN 特征置零，验证图神经网络分支的贡献 | ✅ |
-| A4 | `n1_inference` | 推理时 N=1（不重新训练），验证 Best-of-8 策略的价值 | ❌ |
+| A1 | `no_danger_loss` | Remove DangerExceedLoss to verify the necessity of danger supervision | ✅ |
+| A2 | `no_svo` | Set the SVO input to zero to verify the effectiveness of the behavioural-intent condition | ✅ |
+| A3 | `no_gnn` | Set the GNN features to zero to verify the contribution of the graph neural network branch | ✅ |
+| A4 | `n1_inference` | N=1 at inference (no retraining) to verify the value of the Best-of-8 strategy | ❌ |
 
-## 基准模型
+## Reference model
 
-对比基准：`experiments/danger_generation/training_runs/full_training_v3_10/best_model.pt`
-- danger_weight=5.0，epoch 12，Margin Met=87.5%，Valid Rate=100%
+Comparison reference: `experiments/danger_generation/training_runs/full_training_v3_10/best_model.pt`
+- danger_weight=5.0, epoch 12, Margin Met=87.5%, Valid Rate=100%
 
-## 文件说明
+## File description
 
 ```
 danger_gen_ablation/
-├── train_ablation.py     训练脚本（支持 --ablation 参数驱动 A1/A2/A3）
-├── eval_ablation.py      评估脚本（支持所有消融组，输出汇总对比表）
-├── results/              各消融组评估输出目录
+├── train_ablation.py     Training script (the --ablation argument drives A1/A2/A3)
+├── eval_ablation.py      Evaluation script (supports all ablation groups, outputs a summary comparison table)
+├── results/              Evaluation output directory for each ablation group
 │   ├── no_danger_loss/
 │   ├── no_svo/
 │   ├── no_gnn/
 │   ├── n1_inference/
-│   └── ablation_summary.json   最终对比表
+│   └── ablation_summary.json   Final comparison table
 └── README.md
 ```
 
-## 路径约定
+## Path conventions
 
-所有脚本使用 `os.path.dirname(os.path.dirname(__file__))` 定位 GNN_Trans 根目录，
-依赖的 `models/`、`utils/`、`config.py` 均从根目录解析，无需修改现有文件。
+All scripts use `os.path.dirname(os.path.dirname(__file__))` to locate the GNN_Trans root directory;
+the dependencies `models/`, `utils/` and `config.py` are all resolved from the root directory, so no existing files need to be modified.
 
-## 运行方式
+## How to run
 
-> 工作目录：`/mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans`，激活 `nuplan` 环境。
+> Working directory: `/mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans`, with the `nuplan` environment activated.
 
 ```bash
-# 训练消融组（各约 50 epochs，每组约 30~60 分钟）
+# Train the ablation groups (about 50 epochs each, about 30~60 minutes per group)
 python danger_gen_ablation/train_ablation.py --ablation no_danger_loss
 python danger_gen_ablation/train_ablation.py --ablation no_svo
 python danger_gen_ablation/train_ablation.py --ablation no_gnn
 
-# 快速调试（只用 20 个样本，跑 5 epoch）
+# Quick debugging (only 20 samples, 5 epochs)
 python danger_gen_ablation/train_ablation.py --ablation no_danger_loss --max_samples 20 --epochs 5
 
-# 评估所有组（含 A4 N=1，Full 参考值）
+# Evaluate all groups (including A4 N=1 and the Full reference value)
 python danger_gen_ablation/eval_ablation.py --num_samples 40 --device cuda
 
-# 只评估特定组
+# Evaluate specific groups only
 python danger_gen_ablation/eval_ablation.py --groups A1 A4 Full
 ```
 
-消融模型保存到 `danger_gen_ablation/results/<name>/best_model.pt`，
-评估汇总输出到 `danger_gen_ablation/results/ablation_summary.json`。
+Ablation models are saved to `danger_gen_ablation/results/<name>/best_model.pt`,
+and the evaluation summary is written to `danger_gen_ablation/results/ablation_summary.json`.
 
-## 实现细节
+## Implementation details
 
-| 消融组 | 实现方式 |
+| Ablation group | Implementation |
 |--------|---------|
 | A1 no_danger_loss | `DangerExceedLoss(danger_weight=0.0)` |
-| A2 no_svo | 训练循环中 `svo_angle = torch.zeros_like(svo_angle)` |
-| A3 no_gnn | `get_encoder_features()` 后将后 128 维清零（indices 256:384） |
-| A4 N=1   | `eval_ablation.py` 使用 v3.10 模型，`num_inference_samples=1` |
+| A2 no_svo | `svo_angle = torch.zeros_like(svo_angle)` in the training loop |
+| A3 no_gnn | After `get_encoder_features()`, the last 128 dimensions are zeroed (indices 256:384) |
+| A4 N=1   | `eval_ablation.py` uses the v3.10 model, `num_inference_samples=1` |

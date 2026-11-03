@@ -1,147 +1,147 @@
-# 教程 01：环境配置与项目结构
+# Tutorial 01: Environment Setup and Project Structure
 
-## 1. 运行环境
+## 1. Runtime environment
 
-### Conda 环境
+### Conda environment
 
-本项目所有命令必须在 `nuplan` 环境下运行：
+All commands in this project must be run in the `nuplan` environment:
 
 ```bash
 conda activate nuplan
 ```
 
-验证环境是否正确：
+Verify that the environment is correct:
 
 ```bash
 python -c "import torch; import torch_geometric; print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available())"
 ```
 
-正常输出示例：
+Example of normal output:
 ```
 PyTorch: 2.x.x
 CUDA: True
 ```
 
-### 工作目录约定
+### Working directory conventions
 
-**轨迹预测**相关命令，在 **nuplan-devkit 根目录** 运行（NuPlan Hydra 仿真需要）：
+Commands related to **trajectory prediction** are run from the **nuplan-devkit root directory** (required by NuPlan Hydra simulation):
 ```bash
 cd /mnt/local/Xiao_Yi/nuplan-devkit
 ```
 
-**危险场景生成**相关命令，在 **GNN_Trans 根目录** 运行：
+Commands related to **danger scenario generation** are run from the **GNN_Trans root directory**:
 ```bash
 cd /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans
 ```
 
-> **记住这个区别**，大多数报路径错误的问题都是工作目录搞错了。
+> **Remember this difference**: most reported path errors are caused by the wrong working directory.
 
 ---
 
-## 2. 项目目录结构
+## 2. Project directory structure
 
 ```
 GNN_Trans/
 │
-├── config.py                        ← 全局配置（路径、超参数）★ 最常修改
+├── config.py                        ← Global configuration (paths, hyperparameters) ★ most frequently modified
 │
-│   【轨迹预测入口】
-├── train.py                         ← GNN+Transformer 轨迹预测训练
-├── train_transformer_only.py        ← Transformer-only 基线训练
-├── train_lstm.py                    ← LSTM 基线训练
-├── run_gnn_manifest_eval.py         ← GNN+Trans 评估
-├── run_nuboard_simulation.py        ← NuPlan 规划仿真
-├── idm_predictor.py / lstm_predictor.py  ← 模型推理模块
+│   [Trajectory prediction entry points]
+├── train.py                         ← GNN+Transformer trajectory prediction training
+├── train_transformer_only.py        ← Transformer-only baseline training
+├── train_lstm.py                    ← LSTM baseline training
+├── run_gnn_manifest_eval.py         ← GNN+Trans evaluation
+├── run_nuboard_simulation.py        ← NuPlan planning simulation
+├── idm_predictor.py / lstm_predictor.py  ← Model inference modules
 │
-│   【危险场景生成入口】
-├── train_diffusion_gnn_trans.py     ← Diffusion 训练（当前主入口）★
-├── generate_danger_scenes.py        ← 批量生成危险场景（推理）★
-├── run_full_training_DEPRECATED.py  ← 旧版训练脚本（v3.x，已废弃）
+│   [Danger scenario generation entry points]
+├── train_diffusion_gnn_trans.py     ← Diffusion training (current main entry point) ★
+├── generate_danger_scenes.py        ← Batch generation of danger scenarios (inference) ★
+├── run_full_training_DEPRECATED.py  ← Old training script (v3.x, deprecated)
 │
-├── danger_gen_ablation/             ← 消融实验（危险场景生成）
-│   ├── README.md                    ← 消融实验说明
-│   ├── train_ablation.py            ← 消融训练（待写）
-│   ├── eval_ablation.py             ← 消融评估（待写）
-│   └── results/                     ← 各消融组评估输出
+├── danger_gen_ablation/             ← Ablation experiments (danger scenario generation)
+│   ├── README.md                    ← Ablation experiment description
+│   ├── train_ablation.py            ← Ablation training (to be written)
+│   ├── eval_ablation.py             ← Ablation evaluation (to be written)
+│   └── results/                     ← Evaluation output for each ablation group
 │
-├── configs/                         ← NuPlan Hydra 配置文件
-│   ├── simple_simulation.yaml       ← 仿真入口配置
-│   └── planner/                     ← planner 配置
+├── configs/                         ← NuPlan Hydra configuration files
+│   ├── simple_simulation.yaml       ← Simulation entry configuration
+│   └── planner/                     ← planner configuration
 │
-├── data/                            ← 所有数据（不进 Git）
-│   ├── model_weights/               ← GNN+Trans 轨迹预测权重
+├── data/                            ← All data (not in Git)
+│   ├── model_weights/               ← GNN+Trans trajectory prediction weights
 │   │   └── best_model.pth           ★
-│   ├── processed_data_by_type/      ← 按场景类型分类的训练数据
-│   │   └── processed_medium_magnitude_speed/  ← 默认训练集（20002 个场景）
+│   ├── processed_data_by_type/      ← Training data classified by scenario type
+│   │   └── processed_medium_magnitude_speed/  ← Default training set (20002 scenarios)
 │   └── ...
 │
-├── diffusion_danger_model/          ← 危险场景生成专用数据
-│   ├── processed_data/              ← Diffusion 训练数据（803 个 pkl）★
-│   ├── danger_pair_scenarios/       ← 危险对场景（带标签，390 个）★
+├── diffusion_danger_model/          ← Data dedicated to danger scenario generation
+│   ├── processed_data/              ← Diffusion training data (803 pkl) ★
+│   ├── danger_pair_scenarios/       ← Danger pair scenarios (labelled, 390) ★
 │   └── ttc_filter_results/
 │
-├── experiments/                     ← 所有实验结果（不进 Git）
+├── experiments/                     ← All experiment results (not in Git)
 │   ├── danger_generation/
 │   │   ├── training_runs/
-│   │   │   ├── full_training_v3_10/ ← 当前最优模型 ★（Margin Met 87.5%）
+│   │   │   ├── full_training_v3_10/ ← Current best model ★ (Margin Met 87.5%)
 │   │   │   │   └── best_model.pt
-│   │   │   └── full_training_v3_1 ~ v3_11/  ← 历史版本
-│   │   └── ablation/               ← 消融实验结果（运行后生成）
-│   ├── analysis/gnn_trans_ablation/ ← GNN+Trans 轨迹预测消融
-│   └── baselines/                  ← Transformer-only / LSTM 训练记录
+│   │   │   └── full_training_v3_1 ~ v3_11/  ← Historical versions
+│   │   └── ablation/               ← Ablation experiment results (generated after running)
+│   ├── analysis/gnn_trans_ablation/ ← GNN+Trans trajectory prediction ablation
+│   └── baselines/                  ← Transformer-only / LSTM training records
 │
-├── src/                             ← 库代码（两条研究线共用）
+├── src/                             ← Library code (shared by both research lines)
 │   ├── danger_generation/
 │   │   ├── models/                  ← danger_diffusion.py, scene_condition_encoder.py
 │   │   └── visualization/           ← run_evaluation.py ★
 │   ├── ego_planning/
 │   │   ├── planner/                 ← GNNTransPlanner
 │   │   └── nuboard/
-│   └── shared/utils/                ← danger_score.py, dataset.py 等
+│   └── shared/utils/                ← danger_score.py, dataset.py, etc.
 │
 └── docs/
-    ├── DANGER_GENERATION.md                 ← 危险场景生成研究线全部入口导航 ★
-    ├── TRAJECTORY_PREDICTION.md             ← 轨迹预测研究线全部入口导航 ★
-    ├── reference/                           ← 技术说明与排错文档
-    ├── reports/                             ← 结果总结、汇报稿、技术报告
-    └── tutorials/                           ← 你现在在这里
+    ├── DANGER_GENERATION.md                 ← Navigation for all entry points of the danger scenario generation research line ★
+    ├── TRAJECTORY_PREDICTION.md             ← Navigation for all entry points of the trajectory prediction research line ★
+    ├── reference/                           ← Technical notes and troubleshooting documents
+    ├── reports/                             ← Result summaries, presentation drafts, technical reports
+    └── tutorials/                           ← You are here
 ```
 
-> `utils/`, `models/`, `visualization/` 等根目录下的目录均为 **symlink**，
-> 指向 `src/` 下真实位置，不需要手动处理。
-> 两条研究线的入口说明现在统一放在 `docs/` 根下，按研究线查阅 `docs/DANGER_GENERATION.md` 或 `docs/TRAJECTORY_PREDICTION.md`。
+> Directories such as `utils/`, `models/`, `visualization/` under the root directory are all **symlinks**,
+> pointing to the real locations under `src/`; no manual handling is needed.
+> The entry-point descriptions of both research lines are now gathered under the `docs/` root; consult `docs/DANGER_GENERATION.md` or `docs/TRAJECTORY_PREDICTION.md` by research line.
 
 ---
 
-## 3. 关键配置文件详解
+## 3. Key configuration files in detail
 
-### `config.py` — 全局参数（最常需要修改）
+### `config.py` — Global parameters (most frequently need modifying)
 
 ```python
-# 数据路径（一般不需要改，除非挂载点变了）
+# Data paths (usually no need to change, unless the mount point has changed)
 DATA_PATH   = "/mnt/local/Xiao_Yi/nuplan-devkit/nuplan/dataset/nuplan-v1.1/splits/train_pittsburgh"
 MAP_PATH    = '/mnt/local/Xiao_Yi/nuplan-devkit/nuplan/dataset/maps'
 
-# 训练数据路径 ← 换场景类型时改这里
+# Training data paths ← change here when switching scenario type
 TRAIN_PATH  = ".../data/processed_data_by_type/processed_medium_magnitude_speed"
 TEST_PATH   = ".../data/processed_data_by_type/processed_medium_magnitude_speed"
 
-# 训练超参数
+# Training hyperparameters
 EPOCHS      = 100
 BATCH_SIZE  = 8
 LEARNING_RATE = 1e-3
 
-# 模型架构
-EMBED_DIM   = 128      # Transformer 嵌入维度
-NUM_LAYERS  = 3        # Transformer 层数
-NUM_HEADS   = 8        # 多头注意力头数
+# Model architecture
+EMBED_DIM   = 128      # Transformer embedding dimension
+NUM_LAYERS  = 3        # Number of Transformer layers
+NUM_HEADS   = 8        # Number of multi-head attention heads
 ```
 
-修改 `config.py` 后直接运行对应训练脚本即可生效，不需要命令行参数。
+After modifying `config.py`, simply run the corresponding training script for the change to take effect; no command-line arguments are needed.
 
-### `train_diffusion_gnn_trans.py` — Diffusion 训练配置（推荐用 CLI）
+### `train_diffusion_gnn_trans.py` — Diffusion training configuration (CLI recommended)
 
-当前训练入口不再改脚本内的 `CUSTOM_CONFIG`，而是直接传命令行参数：
+The current training entry point no longer requires editing `CUSTOM_CONFIG` inside the script; instead, pass command-line arguments directly:
 
 ```bash
 cd /mnt/local/Xiao_Yi/nuplan-devkit/GNN_Trans
@@ -154,7 +154,7 @@ python train_diffusion_gnn_trans.py \
     --device cuda
 ```
 
-如果只想检查数据和前向流程，不正式训练，可以加：
+If you only want to check the data and the forward pass without actual training, you can add:
 
 ```bash
 python train_diffusion_gnn_trans.py --test_only
@@ -162,54 +162,54 @@ python train_diffusion_gnn_trans.py --test_only
 
 ---
 
-## 4. 两条研究线的数据流向
+## 4. Data flow of the two research lines
 
-### 轨迹预测
+### Trajectory prediction
 
 ```
-NuPlan 原始数据库 (.db 文件)
+NuPlan raw database (.db files)
     │
     ↓ scripts/preprocessing/process_nuplan_to_12d.py
-    │  （提取场景图特征，输出 .pkl 文件）
+    │  (extract scene graph features, output .pkl files)
     │
-data/processed_data_by_type/<场景类型>/   ← 20002 个 .pkl
+data/processed_data_by_type/<scenario type>/   ← 20002 .pkl
     │
     ↓ train.py
-    │  （GNN 编码 + Transformer 预测）
+    │  (GNN encoding + Transformer prediction)
     │
-data/model_weights/best_model.pth          ← 保存的权重
+data/model_weights/best_model.pth          ← saved weights
     │
     ↓ run_nuboard_simulation.py / run_gnn_manifest_eval.py
     │
-仿真结果 / ADE·FDE 评估指标
+Simulation results / ADE·FDE evaluation metrics
 ```
 
-> **好消息**：`processed_data_by_type/` 和 `model_weights/best_model.pth` 已经存在，
-> 可以直接跳到训练或评估步骤。
+> **Good news**: `processed_data_by_type/` and `model_weights/best_model.pth` already exist,
+> so you can skip straight to the training or evaluation step.
 
-### 危险场景生成
+### Danger scenario generation
 
 ```
-NuPlan 原始数据库
+NuPlan raw database
     │
     ↓ diffusion_danger_model/process_pittsburgh.py
-    │  （提取 12D 场景特征）
+    │  (extract 12D scene features)
     │
-diffusion_danger_model/processed_data/      ← 804 个 .pkl（已有）
+diffusion_danger_model/processed_data/      ← 804 .pkl (already present)
     │
     ↓ utils/ttc_filter.py
-    │  （TTC 筛选，找出存在碰撞风险的配对）
+    │  (TTC filtering, find pairs with collision risk)
     │
-diffusion_danger_model/danger_pair_scenarios/ ← 81 个 .pkl（已有）
+diffusion_danger_model/danger_pair_scenarios/ ← 81 .pkl (already present)
     │
     ↓ train_diffusion_gnn_trans.py
-    │  （DDPM Diffusion 训练，v4.0：TrajectoryPredictionHead + 动态 danger_target）
+    │  (DDPM Diffusion training, v4.0: TrajectoryPredictionHead + dynamic danger_target)
     │
-experiments/.../full_training_v3_10/best_model.pt ← 当前最优（已有，Margin Met 87.5%）
+experiments/.../full_training_v3_10/best_model.pt ← current best (already present, Margin Met 87.5%)
     │
-    ├─→ visualization/run_evaluation.py   ← 统计评估
+    ├─→ visualization/run_evaluation.py   ← statistical evaluation
     │
-    └─→ generate_danger_scenes.py         ← 批量生成新场景
+    └─→ generate_danger_scenes.py         ← batch generation of new scenarios
 ```
 
-> **好消息**：所有数据和模型都已准备好，可以直接运行评估和生成。
+> **Good news**: all data and models are ready, so you can run evaluation and generation directly.

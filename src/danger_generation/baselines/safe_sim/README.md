@@ -5,78 +5,78 @@
 
 ---
 
-## 接入难度评估：高（需较多适配工作）
+## Integration difficulty assessment: high (requires substantial adaptation work)
 
-### 关键障碍
+### Key obstacles
 
-| 障碍 | 细节 | 所需工作 |
+| Obstacle | Details | Work required |
 |------|------|---------|
-| **输入格式不兼容** | Safe-Sim 要求 rasterized HD map（224×224 图像）+ trajectory；我们的 pkl 只有 trajectory，无地图 | 实现 HD map tile → raster 转换模块 |
-| **trajdata 依赖** | 使用 NVIDIA 的修改版 `trajdata` fork；nuPlan 支持仅有 config，无实际实现 | 实现 `nuPlan → AgentBatch` 适配器 |
-| **闭环设计** | 无 standalone inference；依赖 `rollout_episodes()` 整个仿真环境 | 编写跳过环境循环的 inference wrapper |
-| **Checkpoint 域差** | 公开的 checkpoint 仅在 nuScenes 上训练；nuPlan 无公开权重 | 用 nuPlan 数据重新训练或 fine-tune |
-| **环境依赖冲突** | `pytorch-lightning==1.9.0` + `python=3.8` + trajdata fork | 独立 conda 环境，与现有项目隔离 |
+| **Incompatible input format** | Safe-Sim requires a rasterized HD map (224×224 image) + trajectory; our pkl contains only trajectories, no map | Implement an HD map tile → raster conversion module |
+| **trajdata dependency** | Uses NVIDIA's modified `trajdata` fork; nuPlan support exists only as config, with no actual implementation | Implement a `nuPlan → AgentBatch` adapter |
+| **Closed-loop design** | No standalone inference; depends on the whole simulation environment via `rollout_episodes()` | Write an inference wrapper that skips the environment loop |
+| **Checkpoint domain gap** | The public checkpoint is trained only on nuScenes; there are no public weights for nuPlan | Retrain or fine-tune on nuPlan data |
+| **Environment dependency conflicts** | `pytorch-lightning==1.9.0` + `python=3.8` + trajdata fork | Separate conda environment, isolated from the existing project |
 
-### 结论
+### Conclusion
 
-在 nuPlan pkl 数据上直接运行 Safe-Sim 推理**不可行**，需完整重新适配。
-论文对比建议：
-- **方案 A（推荐）**：直接引用 Safe-Sim 论文中 nuScenes 上的公开数字，注明 domain 不同
-- **方案 B**：完成以下适配步骤，在 nuPlan 上复现（工作量 ~1-2 周）
+Running Safe-Sim inference directly on nuPlan pkl data is **not feasible**; a full re-adaptation is required.
+Recommendations for the paper comparison:
+- **Option A (recommended)**: cite the public nuScenes numbers from the Safe-Sim paper directly, noting that the domain differs
+- **Option B**: complete the adaptation steps below and reproduce on nuPlan (effort ~1-2 weeks)
 
 ---
 
-## 方案 B 接入步骤
+## Option B integration steps
 
-### Step 1：安装环境
+### Step 1: Install the environment
 
 ```bash
-# 独立 conda 环境
+# Separate conda environment
 conda create -n safe_sim python=3.8
 conda activate safe_sim
 
-# Clone 官方 repo
+# Clone the official repo
 git clone https://github.com/jxmmy7777/safe-sim.git /tmp/safe-sim
 cd /tmp/safe-sim
 
-# 安装修改版 trajdata（必须用 fork）
+# Install the modified trajdata (the fork must be used)
 pip install -e trajdata/
 
-# 安装主依赖
+# Install the main dependencies
 pip install -r requirements.txt
 ```
 
-### Step 2：下载 Checkpoint
+### Step 2: Download the Checkpoint
 
 ```bash
-# Hugging Face 上的 nuScenes 预训练 checkpoint（见论文 README）
-# nuPlan checkpoint 目前无公开权重
+# nuScenes pretrained checkpoint on Hugging Face (see the paper's README)
+# There are currently no public weights for a nuPlan checkpoint
 ```
 
-### Step 3：地图 Rasterizer（最大工作量）
+### Step 3: Map Rasterizer (largest workload)
 
-Safe-Sim 模型输入 `obs_dict["image"]` 是 `[B, C, 224, 224]` 的栅格化地图。
-需要：
-1. 读取 nuPlan HD map（`maps/*.db` 文件）
-2. 以 ego 当前位置为中心，生成 224×224 的地图图像（道路、lane、边界等 channel）
-3. 对应文件：`safe_sim/adapter.py` 的 `rasterize_map()` 函数（待实现）
+The Safe-Sim model input `obs_dict["image"]` is a rasterized map of shape `[B, C, 224, 224]`.
+Required:
+1. Read the nuPlan HD map (`maps/*.db` files)
+2. Generate a 224×224 map image centred on the current ego position (channels for roads, lanes, boundaries, etc.)
+3. Corresponding file: the `rasterize_map()` function in `safe_sim/adapter.py` (to be implemented)
 
-### Step 4：数据适配器
+### Step 4: Data adapter
 
-将我们的 pkl 格式转换为 Safe-Sim 所需的 `obs_dict`（见 `adapter.py`）。
+Convert our pkl format into the `obs_dict` required by Safe-Sim (see `adapter.py`).
 
-### Step 5：Inference Wrapper
+### Step 5: Inference Wrapper
 
-绕过 `rollout_episodes()` 闭环，仅执行单次 forward pass，获取生成轨迹。
+Bypass the `rollout_episodes()` closed loop, execute only a single forward pass, and obtain the generated trajectories.
 
 ---
 
-## 文件结构
+## File structure
 
 ```
 safe_sim/
-├── README.md           # 本文件
+├── README.md           # This file
 ├── __init__.py
-├── adapter.py          # pkl → obs_dict 格式转换（Step 3-4 的核心）
-└── inference.py        # 单次 forward pass wrapper（Step 5）
+├── adapter.py          # pkl → obs_dict format conversion (core of Steps 3-4)
+└── inference.py        # Single forward pass wrapper (Step 5)
 ```
